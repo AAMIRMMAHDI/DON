@@ -1,57 +1,126 @@
-name: 🌐 دانلودر تحت وب (تونل خودکار)
+name: 📥 دانلود ویدیو و ذخیره در ریپازیتوری
 
 on:
   workflow_dispatch:
+    inputs:
+      video_url:
+        description: '🔗 لینک ویدیو (یوتیوب و غیره)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
-  run-web-app:
+  download-and-save:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
+    timeout-minutes: 60
     steps:
-      - name: نصب پیش‌نیازها
+      - name: بررسی لینک
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 python3-pip wget
-          pip3 install flask flask-socketio yt-dlp
-
-      - name: دریافت cloudflared
-        run: |
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared-linux-amd64
-          sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
-
-      - name: دریافت فایل‌های برنامه
-        uses: actions/checkout@v4   # فایل app.py و پوشه static را از مخزن می‌خواند
-
-      - name: اجرای سرور و تونل
-        run: |
-          echo "🚀 اجرای برنامه Flask..."
-          python3 app.py &
-          sleep 5
-          
-          echo "🔗 برقراری تونل Cloudflare..."
-          # cloudflared tunnel --url http://localhost:5000 را در بک‌گراند اجرا می‌کنیم
-          # خروجی آن را به فایل می‌فرستیم تا لینک را استخراج کنیم
-          nohup cloudflared tunnel --url http://localhost:5000 > tunnel.log 2>&1 &
-          sleep 5
-          
-          # لینک trycloudflare.com را از لاگ پیدا کن
-          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' tunnel.log | head -1)
-          
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ نتوانست لینک تونل را پیدا کند. محتوای لاگ:"
-            cat tunnel.log
+          if [ -z "${{ github.event.inputs.video_url }}" ]; then
+            echo "❌ لینک ویدیو وارد نشده است!"
             exit 1
           fi
-          
-          echo "=============================================="
-          echo "🌐 آدرس سایت شما:"
-          echo "👉 $TUNNEL_URL"
-          echo "=============================================="
-          echo "تا زمانی که این تب Actions باز است، سایت آنلاین می‌ماند."
-          echo "برای قطع سرویس، workflow را Cancel کنید."
-          echo ""
-          
-          # نگه داشتن workflow تا زمانی که دستی کنسل شود
-          while true; do sleep 60; done
+          echo "✅ لینک دریافت شد: ${{ github.event.inputs.video_url }}"
+
+      - name: تنظیمات گیت
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: نصب ابزارهای مورد نیاز
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip zip curl bc
+          pip3 install yt-dlp
+
+      - name: دانلود ویدیو با yt-dlp
+        run: |
+          yt-dlp \
+            --format "best[height<=720]/best" \
+            --no-playlist \
+            --output "video.%(ext)s" \
+            "${{ github.event.inputs.video_url }}"
+
+      - name: آماده‌سازی فایل برای ریپازیتوری
+        run: |
+          ORIGINAL_FILE=$(ls video.* | head -n1)
+          if [ ! -f "$ORIGINAL_FILE" ]; then
+            echo "❌ فایل ویدیو پیدا نشد!"
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s "$ORIGINAL_FILE")
+          SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+          echo "حجم فایل: ${SIZE_MB} MB"
+
+          # حداکثر حجم مجاز برای commit مستقیم (گیتهاب ۱۰۰ مگابایت اجازه می‌دهد)
+          MAX_DIRECT_MB=95
+          MAX_DIRECT_BYTES=$((MAX_DIRECT_MB * 1024 * 1024))
+
+          mkdir -p downloads
+          BASE_NAME=$(basename "$ORIGINAL_FILE" | sed 's/\.[^.]*$//')
+          EXT="${ORIGINAL_FILE##*.}"
+
+          if [ "$FILE_SIZE" -le "$MAX_DIRECT_BYTES" ]; then
+            echo "فایل کوچک است → انتقال مستقیم به downloads"
+            cp "$ORIGINAL_FILE" "downloads/${BASE_NAME}.${EXT}"
+            cat > "downloads/README.md" <<EOF
+# ${BASE_NAME}
+
+- فایل اصلی: \`${BASE_NAME}.${EXT}\`
+- حجم: ${SIZE_MB} MB
+- وضعیت: ✅ آماده دانلود
+
+[دانلود فایل](./${BASE_NAME}.${EXT})
+EOF
+          else
+            echo "فایل بزرگ است → تقسیم به چند بخش zip"
+            mkdir -p "downloads/${BASE_NAME}"
+            # تقسیم با zip (هر بخش ۹۵ مگابایت)
+            zip -s ${MAX_DIRECT_MB}m -j "downloads/${BASE_NAME}/${BASE_NAME}.zip" "$ORIGINAL_FILE"
+
+            # تولید README با لینک بخش‌ها
+            cat > "downloads/${BASE_NAME}/README.md" <<EOF
+# ${BASE_NAME}
+
+فایل اصلی بزرگتر از ۱۰۰ مگابایت بوده، بنابراین به چند بخش zip تقسیم شده است.
+
+## بخش‌های فایل
+
+$(for part in downloads/${BASE_NAME}/*.zip downloads/${BASE_NAME}/*.z[0-9]*; do
+  [ -f "$part" ] || continue
+  PART_NAME=$(basename "$part")
+  echo "- \`${PART_NAME}\` : [دانلود](${PART_NAME})"
+done)
+
+## نحوه extract
+1. همه بخش‌ها را دانلود کنید.
+2. فایل \`${BASE_NAME}.zip\` را با نرم‌افزارهای معمولی (WinRAR، 7-Zip) باز کنید.
+3. فایل اصلی خارج می‌شود.
+
+EOF
+          fi
+
+      - name: commit و push به ریپازیتوری
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add downloads/
+          if ! git diff --cached --quiet; then
+            git commit -m "دانلود ویدیو: ${{ github.event.inputs.video_url }} [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ فایل با موفقیت در ریپازیتوری ذخیره شد."
+          else
+            echo "ℹ️ تغییری برای commit وجود ندارد."
+          fi
+
+      - name: نمایش لینک نهایی
+        run: |
+          echo "========================================="
+          echo "✅ ویدیو در ریپازیتوری ذخیره شد:"
+          echo "https://github.com/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
+          echo "========================================="
