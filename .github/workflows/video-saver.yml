@@ -1,18 +1,22 @@
-name: 📥 دانلود ویدیو (ساده)
+name: 📥 دانلود ویدیو و ذخیره در ریپازیتوری
 
 on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: '🔗 لینک ویدیو (مثلاً یوتیوب)'
+        description: '🔗 لینک ویدیو (یوتیوب، آپارات، و...)'
         required: true
         type: string
 
+permissions:
+  contents: write
+
 jobs:
-  download:
+  download-and-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - name: بررسی لینک
+      - name: بررسی لینک ورودی
         run: |
           if [ -z "${{ github.event.inputs.video_url }}" ]; then
             echo "❌ لینک ویدیو وارد نشده است!"
@@ -20,22 +24,95 @@ jobs:
           fi
           echo "✅ لینک دریافت شد: ${{ github.event.inputs.video_url }}"
 
+      - name: دریافت کدهای ریپازیتوری
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: تنظیمات گیت
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: نصب yt-dlp
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip
+          sudo apt-get install -y python3 python3-pip zip
           pip3 install yt-dlp
 
       - name: دانلود ویدیو
+        id: download
         run: |
           yt-dlp \
             --format "best[height<=720]/best" \
             --no-playlist \
             --output "video.%(ext)s" \
             "${{ github.event.inputs.video_url }}"
+          
+          # پیدا کردن نام واقعی فایل دانلود شده
+          FILE=$(ls video.* | head -n1)
+          if [ ! -f "$FILE" ]; then
+            echo "❌ فایل ویدیو پیدا نشد!"
+            exit 1
+          fi
+          echo "filename=$FILE" >> $GITHUB_OUTPUT
+          SIZE=$(stat -c%s "$FILE")
+          echo "size=$SIZE" >> $GITHUB_OUTPUT
+          echo "حجم فایل: $((SIZE/1024/1024)) MB"
 
-      - name: آپلود فایل به عنوان Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: video-file
-          path: video.*
+      - name: آماده‌سازی برای ریپازیتوری (در صورت بزرگ بودن فایل)
+        run: |
+          FILE="${{ steps.download.outputs.filename }}"
+          SIZE=${{ steps.download.outputs.size }}
+          THRESHOLD_MB=95
+          THRESHOLD_BYTES=$((THRESHOLD_MB * 1024 * 1024))
+          
+          mkdir -p downloads
+          
+          if [ "$SIZE" -gt "$THRESHOLD_BYTES" ]; then
+            echo "⚠️ فایل بزرگتر از ${THRESHOLD_MB}MB است → تقسیم به چند بخش zip"
+            BASE_NAME=$(basename "$FILE" | sed 's/\.[^.]*$//')
+            mkdir -p "downloads/${BASE_NAME}"
+            # تقسیم با zip (هر بخش ۹۵ مگابایت)
+            zip -s ${THRESHOLD_MB}m -j "downloads/${BASE_NAME}/${BASE_NAME}.zip" "$FILE"
+            # تولید README داخل همان پوشه
+            cat > "downloads/${BASE_NAME}/README.md" <<EOF
+# ${BASE_NAME}
+
+فایل اصلی بزرگتر از ${THRESHOLD_MB}MB است، به بخش‌های زیر تقسیم شده:
+
+$(for part in downloads/${BASE_NAME}/*.zip downloads/${BASE_NAME}/*.z[0-9]*; do
+  [ -f "$part" ] || continue
+  echo "- \`$(basename "$part")\` : [دانلود]($(basename "$part"))"
+done)
+
+**نحوه extract:** همه بخش‌ها را دانلود کنید، سپس فایل \`${BASE_NAME}.zip\` را با WinRAR یا 7-Zip باز کنید.
+
+---
+تولید شده توسط [avasam.ir](https://avasam.ir)
+EOF
+            echo "✅ فایل تقسیم شده در downloads/${BASE_NAME}/"
+          else
+            echo "✅ فایل کوچک است → کپی مستقیم"
+            cp "$FILE" "downloads/$FILE"
+            echo "✅ فایل در downloads/$FILE قرار گرفت."
+          fi
+
+      - name: commit و push به ریپازیتوری
+        run: |
+          git add downloads/
+          if ! git diff --cached --quiet; then
+            git commit -m "🎬 افزودن ویدیو دانلود شده: ${{ github.event.inputs.video_url }} [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ ویدیو با موفقیت به ریپازیتوری اضافه شد."
+          else
+            echo "ℹ️ تغییر جدیدی وجود ندارد (شاید فایل قبلاً اضافه شده بود)."
+          fi
+
+      - name: نمایش لینک نهایی
+        run: |
+          echo "========================================="
+          echo "📍 ویدیو در ریپازیتوری شما:"
+          echo "https://github.com/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
+          echo "========================================="
