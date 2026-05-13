@@ -1,1119 +1,581 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-================================================================================
-                        VPLAYER - ENTERPRISE MEDIA PLATFORM
-================================================================================
-A complete offline-first, production-grade video downloader and media manager.
-All-in-one single file: Flask backend, queue system, SSH uploader, real-time UI.
-================================================================================
+Enterprise Video Manager – Single‑File Production Platform
+Flask + SocketIO + yt‑dlp + Paramiko + Queue System
+All frontend assets are served locally – fully offline.
 """
 
-import os
-import sys
-import json
-import uuid
-import time
-import threading
-import queue as queue_module
-import logging
-from logging.handlers import RotatingFileHandler
-from datetime import datetime
+import os, sys, json, uuid, time, threading, queue, re, logging
 from pathlib import Path
+from datetime import datetime
+from collections import deque
 
-import yt_dlp
-from flask import Flask, request, jsonify, render_template_string, send_from_directory
+import yt_dlp, paramiko
+from flask import Flask, render_template_string, request, jsonify, send_from_directory
 from flask_socketio import SocketIO, emit
-import paramiko
-import psutil
 from dotenv import load_dotenv
-
-# ============================================================================
-#                               CONFIGURATION
-# ============================================================================
 
 load_dotenv()
 
-BASE_DIR = Path(__file__).parent.absolute()
-STATIC_DIR = BASE_DIR / "static"
-DOWNLOADS_DIR = BASE_DIR / "downloads"
-LOGS_DIR = BASE_DIR / "logs"
+# ─── Configuration ──────────────────────────────────────────────────────────
+class Config:
+    BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+    STATIC_DIR = os.path.join(BASE_DIR, 'static')
+    DOWNLOADS_DIR = os.path.join(BASE_DIR, 'downloads')
+    LOGS_DIR = os.path.join(BASE_DIR, 'logs')
+    QUEUE_FILE = os.path.join(BASE_DIR, 'queue.json')
 
-# Create necessary directories
-for d in [STATIC_DIR, DOWNLOADS_DIR, LOGS_DIR]:
-    d.mkdir(exist_ok=True)
+    SSH_HOST = os.getenv('SSH_HOST', '185.208.175.180')
+    SSH_PORT = int(os.getenv('SSH_PORT', 22))
+    SSH_USER = os.getenv('SSH_USER', 'root')
+    SSH_PASS = os.getenv('SSH_PASSWORD', 'Amir.1388')
+    SSH_REMOTE_PATH = os.getenv('SSH_REMOTE_PATH', '/root/videos/')
 
-# SSH Configuration (from .env)
-SSH_HOST = os.getenv("SSH_HOST", "185.208.175.180")
-SSH_USER = os.getenv("SSH_USER", "root")
-SSH_PASSWORD = os.getenv("SSH_PASSWORD", "Amir.1388")
-SSH_PORT = int(os.getenv("SSH_PORT", 22))
-REMOTE_UPLOAD_PATH = os.getenv("REMOTE_UPLOAD_PATH", "/root/videos/")
+    MAX_CONCURRENT_DOWNLOADS = 2  # single download at a time in queue
 
-# Flask & SocketIO
-app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "vplayer-super-secret-key")
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+os.makedirs(Config.DOWNLOADS_DIR, exist_ok=True)
+os.makedirs(Config.LOGS_DIR, exist_ok=True)
 
-# ============================================================================
-#                               LOGGING SYSTEM
-# ============================================================================
+# ─── Logging Setup ──────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(Config.LOGS_DIR, 'app.log')),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-def setup_logging():
-    log_format = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    # Main log file
-    main_handler = RotatingFileHandler(
-        LOGS_DIR / "vplayer.log", maxBytes=10_485_760, backupCount=5
-    )
-    main_handler.setFormatter(log_format)
-    # Error log file
-    error_handler = RotatingFileHandler(
-        LOGS_DIR / "errors.log", maxBytes=5_242_880, backupCount=3
-    )
-    error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(log_format)
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(log_format)
+# ─── App Initialization ─────────────────────────────────────────────────────
+app = Flask(__name__, static_folder='static', static_url_path='/static')
+app.config['SECRET_KEY'] = os.urandom(24)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-    logger = logging.getLogger("vplayer")
-    logger.setLevel(logging.INFO)
-    logger.addHandler(main_handler)
-    logger.addHandler(error_handler)
-    logger.addHandler(console_handler)
-    return logger
-
-logger = setup_logging()
-
-# ============================================================================
-#                               QUEUE & STATE MANAGEMENT
-# ============================================================================
-
-# Queue items structure
-queue_items = []          # list of dicts, order matters
+# ─── Download Queue & Workers ───────────────────────────────────────────────
+download_queue = deque()          # items waiting
+active_downloads = {}             # sid -> download info
 queue_lock = threading.Lock()
-active_download = None    # current item being processed (dict or None)
-stop_current = threading.Event()
-queue_paused = False
-queue_worker_thread = None
-should_exit = False
+stop_flags = {}                   # sid -> threading.Event()
 
-# Persistence file
-QUEUE_STATE_FILE = BASE_DIR / "queue_state.json"
-
-def save_queue_state():
-    """Persist queue items to disk for recovery."""
-    with queue_lock:
-        # Remove non-serializable objects
-        to_save = []
-        for item in queue_items:
-            item_copy = {
-                k: v for k, v in item.items()
-                if k not in ["progress_hook", "thread"]
-            }
-            to_save.append(item_copy)
-        data = {
-            "items": to_save,
-            "paused": queue_paused
-        }
-    try:
-        with open(QUEUE_STATE_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-        logger.info("Queue state saved.")
-    except Exception as e:
-        logger.error(f"Failed to save queue state: {e}")
-
-def load_queue_state():
-    """Restore queue from disk on startup."""
-    global queue_paused
-    if QUEUE_STATE_FILE.exists():
+def load_queue():
+    if os.path.exists(Config.QUEUE_FILE):
         try:
-            with open(QUEUE_STATE_FILE, "r") as f:
+            with open(Config.QUEUE_FILE, 'r') as f:
                 data = json.load(f)
-            with queue_lock:
-                queue_items.clear()
-                for it in data.get("items", []):
-                    # Restore each item with fresh fields
-                    it["progress"] = 0
-                    it["speed"] = 0
-                    it["eta"] = ""
-                    it["upload_status"] = None
-                    it["remote_path"] = None
-                    it["error"] = None
-                    it["thread"] = None
-                    it["progress_hook"] = None
-                    # If it was downloading when crashed, reset to waiting
-                    if it["status"] in ("downloading", "uploading"):
-                        it["status"] = "waiting"
-                    queue_items.append(it)
-                queue_paused = data.get("paused", False)
-            logger.info(f"Loaded {len(queue_items)} items from queue state.")
+                for item in data:
+                    if item.get('status') not in ('completed', 'failed'):
+                        item['status'] = 'waiting'
+                        download_queue.append(item)
+                return data
         except Exception as e:
-            logger.error(f"Failed to load queue state: {e}")
+            logger.error(f"Failed to load queue: {e}")
+    return []
 
-# ============================================================================
-#                               SSH UPLOAD SERVICE
-# ============================================================================
-
-class SSHUploader:
-    """Handles SFTP upload with retries and progress tracking."""
-
-    @staticmethod
-    def upload_file(local_path, remote_filename, progress_callback=None):
-        """
-        Upload a file via SFTP.
-        Returns (success, remote_path, error_message)
-        """
-        remote_path = os.path.join(REMOTE_UPLOAD_PATH, remote_filename).replace("\\", "/")
-        transport = None
-        sftp = None
+def save_queue():
+    with queue_lock:
+        all_items = list(download_queue) + list(active_downloads.values())
+        # also include completed/failed? We'll save full history in file
+        # For simplicity, we store all known items from queue + active
         try:
-            transport = paramiko.Transport((SSH_HOST, SSH_PORT))
-            transport.connect(username=SSH_USER, password=SSH_PASSWORD)
-            sftp = paramiko.SFTPClient.from_transport(transport)
+            # gather all history from a global list (we'll maintain a history list)
+            pass
+        except:
+            pass
 
-            # Ensure remote directory exists
-            try:
-                sftp.stat(REMOTE_UPLOAD_PATH)
-            except FileNotFoundError:
-                sftp.mkdir(REMOTE_UPLOAD_PATH)
+# Maintain a full history list
+queue_history = []
+queue_history_lock = threading.Lock()
 
-            file_size = os.path.getsize(local_path)
-            uploaded = 0
-
-            def callback_sent(bytes_sent):
-                nonlocal uploaded
-                uploaded += bytes_sent
-                if progress_callback and file_size > 0:
-                    percent = (uploaded / file_size) * 100
-                    progress_callback(percent)
-
-            sftp.put(local_path, remote_path, callback=callback_sent)
-            return True, remote_path, None
+def add_to_history(item):
+    with queue_history_lock:
+        queue_history.append(item)
+        # persist to disk
+        try:
+            with open(Config.QUEUE_FILE, 'w') as f:
+                json.dump(queue_history, f, indent=2)
         except Exception as e:
-            logger.error(f"Upload failed: {e}")
-            return False, None, str(e)
-        finally:
-            if sftp:
-                sftp.close()
-            if transport:
-                transport.close()
+            logger.error(f"Could not save queue history: {e}")
 
-# ============================================================================
-#                               DOWNLOAD MANAGER
-# ============================================================================
+def update_history(sid, updates):
+    with queue_history_lock:
+        for item in queue_history:
+            if item['id'] == sid:
+                item.update(updates)
+                break
+        # persist
+        try:
+            with open(Config.QUEUE_FILE, 'w') as f:
+                json.dump(queue_history, f, indent=2)
+        except Exception as e:
+            logger.error(f"Could not save queue history: {e}")
 
-def progress_hook(item, d):
-    """yt-dlp progress hook."""
-    if d["status"] == "downloading":
-        total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
-        downloaded = d.get("downloaded_bytes", 0)
-        if total > 0:
-            percent = (downloaded / total) * 100
-            item["progress"] = percent
-            # Speed and ETA
-            speed = d.get("speed", 0)
-            item["speed"] = speed if speed else 0
-            eta = d.get("eta", 0)
-            item["eta"] = f"{eta // 60}:{eta % 60:02d}" if eta else "N/A"
-            # Emit real-time update
-            socketio.emit("queue_update", {"queue": get_queue_summary()})
-            socketio.emit("progress", {
-                "item_id": item["id"],
-                "percent": percent,
-                "speed": item["speed"],
-                "eta": item["eta"]
-            })
-    elif d["status"] == "finished":
-        item["progress"] = 100
-        item["status"] = "completed"
-        item["filename"] = os.path.basename(d["filename"])
-        item["local_path"] = d["filename"]
-        socketio.emit("queue_update", {"queue": get_queue_summary()})
-        # Start upload automatically
-        start_upload_for_item(item)
+# ─── SSH Upload Service ─────────────────────────────────────────────────────
+def ssh_upload(local_path, filename, sid):
+    """Upload file to remote server using SFTP."""
+    try:
+        transport = paramiko.Transport((Config.SSH_HOST, Config.SSH_PORT))
+        transport.connect(username=Config.SSH_USER, password=Config.SSH_PASS)
+        sftp = paramiko.SFTPClient.from_transport(transport)
 
-def download_video(item):
-    """Worker for a single download."""
-    url = item["url"]
-    item["status"] = "downloading"
-    item["start_time"] = time.time()
-    item["error"] = None
+        remote_path = os.path.join(Config.SSH_REMOTE_PATH, filename).replace('\\', '/')
+        sftp.put(local_path, remote_path, callback=lambda transferred, total: socketio.emit('upload_progress', {
+            'sid': sid,
+            'percent': int(transferred / total * 100) if total else 0
+        }))
 
+        sftp.close()
+        transport.close()
+        return True, remote_path
+    except Exception as e:
+        logger.error(f"SSH upload failed: {e}")
+        return False, str(e)
+
+# ─── Download Function (yt‑dlp) ────────────────────────────────────────────
+def download_video(url, sid, quality='best', format_id=None):
+    """Perform the actual download with progress reporting."""
+    stop_event = stop_flags.get(sid, threading.Event())
+    if stop_event.is_set():
+        return
+
+    outtmpl = os.path.join(Config.DOWNLOADS_DIR, '%(title).100s.%(ext)s')
     ydl_opts = {
-        "outtmpl": str(DOWNLOADS_DIR / "%(title)s.%(ext)s"),
-        "format": "best[height<=720]/best",
-        "noplaylist": True,
-        "progress_hooks": [lambda d: progress_hook(item, d)],
-        "quiet": True,
-        "no_warnings": True,
+        'outtmpl': outtmpl,
+        'format': format_id or quality,
+        'noplaylist': True,
+        'progress_hooks': [lambda d: progress_hook(d, sid)],
+        'quiet': False,
+        'no_warnings': False,
+        'http_chunk_size': 10485760,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            item["title"] = info.get("title", "Unknown")
-            item["duration"] = info.get("duration", 0)
-            item["thumbnail"] = info.get("thumbnail", "")
-            ydl.download([url])
-    except Exception as e:
-        logger.error(f"Download error for {url}: {e}")
-        item["status"] = "failed"
-        item["error"] = str(e)
-        socketio.emit("queue_update", {"queue": get_queue_summary()})
-
-def start_upload_for_item(item):
-    """Trigger SSH upload after successful download."""
-    if item["status"] != "completed":
-        return
-    if not item.get("local_path") or not os.path.exists(item["local_path"]):
-        item["status"] = "failed"
-        item["error"] = "Local file missing after download"
-        socketio.emit("queue_update", {"queue": get_queue_summary()})
-        return
-
-    def upload_thread():
-        item["status"] = "uploading"
-        item["upload_status"] = "starting"
-        socketio.emit("queue_update", {"queue": get_queue_summary()})
-
-        def progress_cb(percent):
-            item["upload_progress"] = percent
-            socketio.emit("upload_progress", {
-                "item_id": item["id"],
-                "percent": percent
+            filename = ydl.prepare_filename(info)
+            update_history(sid, {
+                'filename': os.path.basename(filename),
+                'title': info.get('title', ''),
+                'filesize': info.get('filesize_approx', 0),
+                'status': 'downloading',
+                'progress': 0,
+                'speed': '',
+                'eta': ''
             })
 
-        remote_filename = os.path.basename(item["local_path"])
-        success, remote_path, error = SSHUploader.upload_file(
-            item["local_path"], remote_filename, progress_cb
-        )
-        if success:
-            item["status"] = "uploaded"
-            item["remote_path"] = remote_path
-            item["upload_status"] = "success"
-            logger.info(f"Uploaded {remote_filename} to {remote_path}")
-        else:
-            item["status"] = "failed"
-            item["error"] = f"Upload failed: {error}"
-            item["upload_status"] = "failed"
-            logger.error(f"Upload failed for {item['id']}: {error}")
-        item["completed_time"] = time.time()
-        socketio.emit("queue_update", {"queue": get_queue_summary()})
-        save_queue_state()
+            socketio.emit('progress', {
+                'sid': sid,
+                'percent': 0,
+                'status': 'downloading',
+                'filename': os.path.basename(filename),
+                'speed': '',
+                'eta': ''
+            })
 
-    threading.Thread(target=upload_thread, daemon=True).start()
+            ydl.download([url])
+            # After download, get final filename (may have been renamed)
+            actual_file = filename
+            if not os.path.exists(actual_file):
+                # try to find by partial match
+                possible_files = [f for f in os.listdir(Config.DOWNLOADS_DIR) if f.startswith(os.path.splitext(os.path.basename(filename))[0])]
+                if possible_files:
+                    actual_file = os.path.join(Config.DOWNLOADS_DIR, possible_files[0])
+                else:
+                    raise Exception("Download completed but file not found.")
 
+            # Mark complete
+            update_history(sid, {'status': 'completed', 'progress': 100, 'local_path': actual_file})
+
+            socketio.emit('progress', {
+                'sid': sid,
+                'percent': 100,
+                'status': 'completed',
+                'filename': os.path.basename(actual_file),
+                'speed': '',
+                'eta': ''
+            })
+
+            # Start SSH upload
+            socketio.emit('upload_status', {'sid': sid, 'status': 'uploading'})
+            update_history(sid, {'status': 'uploading'})
+            success, remote = ssh_upload(actual_file, os.path.basename(actual_file), sid)
+            if success:
+                update_history(sid, {'status': 'uploaded', 'remote_path': remote})
+                socketio.emit('upload_status', {'sid': sid, 'status': 'uploaded'})
+            else:
+                update_history(sid, {'status': 'upload_failed', 'error': remote})
+                socketio.emit('upload_status', {'sid': sid, 'status': 'upload_failed', 'error': remote})
+
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        update_history(sid, {'status': 'failed', 'error': str(e)})
+        socketio.emit('error', {'sid': sid, 'message': str(e)})
+
+def progress_hook(d, sid):
+    """yt‑dlp progress hook."""
+    if d['status'] == 'downloading':
+        total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+        downloaded = d.get('downloaded_bytes', 0)
+        if total:
+            percent = (downloaded / total) * 100
+            speed = d.get('speed', 0)
+            if speed:
+                speed_str = f"{speed/1024/1024:.1f} MB/s"
+            else:
+                speed_str = ''
+            eta = d.get('eta', '')
+            update_history(sid, {'progress': percent, 'speed': speed_str, 'eta': eta})
+            socketio.emit('progress', {
+                'sid': sid,
+                'percent': percent,
+                'status': 'downloading',
+                'speed': speed_str,
+                'eta': str(eta)
+            })
+    elif d['status'] == 'finished':
+        update_history(sid, {'progress': 100})
+        socketio.emit('progress', {'sid': sid, 'percent': 100, 'status': 'processing'})
+
+# ─── Queue Worker (background thread) ───────────────────────────────────────
 def queue_worker():
-    """Background worker that processes queue items sequentially."""
-    global active_download
-    while not should_exit:
-        if queue_paused:
-            time.sleep(1)
-            continue
-        # Pick next waiting item
-        with queue_lock:
-            next_item = None
-            for item in queue_items:
-                if item["status"] == "waiting":
-                    next_item = item
-                    break
-        if next_item and active_download is None:
-            active_download = next_item
-            # Download in a separate thread to keep worker responsive
-            def run_download():
-                global active_download
-                download_video(next_item)
-                with queue_lock:
-                    active_download = None
-                save_queue_state()
-                # After download finishes (success or fail), continue loop
-            t = threading.Thread(target=run_download, daemon=True)
-            t.start()
-            next_item["thread"] = t
+    """Continuously process download queue."""
+    while True:
+        if download_queue and len(active_downloads) < Config.MAX_CONCURRENT_DOWNLOADS:
+            with queue_lock:
+                if download_queue:
+                    item = download_queue.popleft()
+                    sid = item['id']
+                    stop_flags[sid] = threading.Event()
+                    active_downloads[sid] = item
+                    update_history(sid, {'status': 'downloading'})
+                    threading.Thread(target=download_video, args=(item['url'], sid, item.get('quality', 'best')), daemon=True).start()
         time.sleep(1)
 
-# ============================================================================
-#                               HELPER FUNCTIONS
-# ============================================================================
+# Start worker
+worker_thread = threading.Thread(target=queue_worker, daemon=True)
+worker_thread.start()
 
-def get_queue_summary():
-    """Return sanitized queue data for frontend."""
-    with queue_lock:
-        summary = []
-        for item in queue_items:
-            summary.append({
-                "id": item["id"],
-                "url": item["url"],
-                "status": item["status"],
-                "progress": item.get("progress", 0),
-                "speed": item.get("speed", 0),
-                "eta": item.get("eta", ""),
-                "title": item.get("title", ""),
-                "filename": item.get("filename", ""),
-                "error": item.get("error"),
-                "upload_status": item.get("upload_status"),
-                "upload_progress": item.get("upload_progress", 0),
-                "remote_path": item.get("remote_path"),
-            })
-        return summary
+# Load previous queue history
+queue_history = load_queue()
+# Re‑add waiting items to active queue
+for item in queue_history:
+    if item['status'] in ('waiting', 'paused'):
+        download_queue.append(item)
 
-def get_system_status():
-    """CPU, RAM, disk, queue stats."""
-    cpu = psutil.cpu_percent(interval=0.5)
-    ram = psutil.virtual_memory().percent
-    disk = psutil.disk_usage(str(BASE_DIR)).percent
-    with queue_lock:
-        waiting = sum(1 for i in queue_items if i["status"] == "waiting")
-        downloading = 1 if active_download else 0
-        uploading = sum(1 for i in queue_items if i["status"] == "uploading")
-    return {
-        "cpu": cpu,
-        "ram": ram,
-        "disk": disk,
-        "waiting": waiting,
-        "downloading": downloading,
-        "uploading": uploading,
-        "total": len(queue_items),
-        "uptime": time.time() - start_time
-    }
-
-def get_video_files():
-    """List all downloaded videos in DOWNLOADS_DIR."""
-    videos = []
-    for f in DOWNLOADS_DIR.iterdir():
-        if f.is_file() and f.suffix.lower() in (".mp4", ".webm", ".mkv", ".avi", ".mov"):
-            videos.append({
-                "name": f.name,
-                "path": f"/downloads/{f.name}",
-                "size": f.stat().st_size,
-                "modified": f.stat().st_mtime
-            })
-    videos.sort(key=lambda x: x["modified"], reverse=True)
-    return videos
-
-# ============================================================================
-#                               FLASK ROUTES
-# ============================================================================
-
-@app.route("/")
+# ─── Routes ──────────────────────────────────────────────────────────────────
+@app.route('/')
 def index():
-    """Main dashboard with all tabs."""
     return render_template_string(HTML_TEMPLATE)
 
-@app.route("/api/queue", methods=["GET"])
-def api_queue():
-    return jsonify(get_queue_summary())
+@app.route('/api/queue/add', methods=['POST'])
+def add_to_queue():
+    urls_text = request.form.get('urls', '').strip()
+    if not urls_text:
+        return jsonify({'error': 'No URLs provided'}), 400
+    urls = [url.strip() for url in urls_text.splitlines() if url.strip()]
+    added = []
+    for url in urls:
+        sid = str(uuid.uuid4())
+        item = {
+            'id': sid,
+            'url': url,
+            'status': 'waiting',
+            'progress': 0,
+            'filename': '',
+            'title': '',
+            'filesize': 0,
+            'speed': '',
+            'eta': '',
+            'created_at': datetime.now().isoformat(),
+            'quality': 'best'
+        }
+        download_queue.append(item)
+        add_to_history(item)
+        added.append(sid)
+    return jsonify({'status': 'ok', 'added': len(added)})
 
-@app.route("/api/queue/add", methods=["POST"])
-def api_add_to_queue():
-    data = request.json
-    urls = data.get("urls", [])
-    if not urls:
-        return jsonify({"error": "No URLs provided"}), 400
+@app.route('/api/queue/status')
+def queue_status():
     with queue_lock:
-        for url in urls:
-            if not url.startswith(("http://", "https://")):
-                continue
-            new_id = str(uuid.uuid4())
-            queue_items.append({
-                "id": new_id,
-                "url": url,
-                "status": "waiting",
-                "progress": 0,
-                "speed": 0,
-                "eta": "",
-                "title": "",
-                "filename": "",
-                "error": None,
-                "upload_status": None,
-                "upload_progress": 0,
-                "remote_path": None,
-                "created_time": time.time(),
-                "completed_time": None,
+        waiting = list(download_queue)
+    active = list(active_downloads.values())
+    all_items = waiting + active + [i for i in queue_history if i['id'] not in [x['id'] for x in waiting+active]]
+    return jsonify(all_items)
+
+@app.route('/api/queue/stop/<sid>', methods=['POST'])
+def stop_download(sid):
+    if sid in stop_flags:
+        stop_flags[sid].set()
+        if sid in active_downloads:
+            item = active_downloads.pop(sid)
+            item['status'] = 'stopped'
+            update_history(sid, {'status': 'stopped'})
+        return jsonify({'status': 'ok'})
+    return jsonify({'error': 'Not found'}), 404
+
+@app.route('/api/videos')
+def list_videos():
+    videos = []
+    for f in os.listdir(Config.DOWNLOADS_DIR):
+        path = os.path.join(Config.DOWNLOADS_DIR, f)
+        if os.path.isfile(path) and f.lower().endswith(('.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv')):
+            videos.append({
+                'name': f,
+                'path': f'/downloads/{f}',
+                'size': os.path.getsize(path),
+                'modified': os.path.getmtime(path)
             })
-    save_queue_state()
-    socketio.emit("queue_update", {"queue": get_queue_summary()})
-    return jsonify({"status": "added", "count": len(urls)})
+    videos.sort(key=lambda x: x['modified'], reverse=True)
+    return jsonify(videos)
 
-@app.route("/api/queue/reorder", methods=["POST"])
-def api_reorder_queue():
-    data = request.json
-    new_order_ids = data.get("order", [])
-    with queue_lock:
-        # Rebuild queue_items according to new_order_ids
-        new_queue = []
-        for qid in new_order_ids:
-            for item in queue_items:
-                if item["id"] == qid:
-                    new_queue.append(item)
-                    break
-        # Append any items not in the new order (should not happen)
-        for item in queue_items:
-            if item not in new_queue:
-                new_queue.append(item)
-        queue_items[:] = new_queue
-    save_queue_state()
-    socketio.emit("queue_update", {"queue": get_queue_summary()})
-    return jsonify({"status": "reordered"})
-
-@app.route("/api/queue/remove/<item_id>", methods=["DELETE"])
-def api_remove_item(item_id):
-    with queue_lock:
-        global active_download
-        for i, item in enumerate(queue_items):
-            if item["id"] == item_id:
-                if item == active_download:
-                    stop_current.set()
-                del queue_items[i]
-                break
-    save_queue_state()
-    socketio.emit("queue_update", {"queue": get_queue_summary()})
-    return jsonify({"status": "removed"})
-
-@app.route("/api/queue/retry/<item_id>", methods=["POST"])
-def api_retry_item(item_id):
-    with queue_lock:
-        for item in queue_items:
-            if item["id"] == item_id and item["status"] in ("failed", "completed", "uploaded"):
-                item["status"] = "waiting"
-                item["error"] = None
-                item["progress"] = 0
-                item["upload_status"] = None
-                break
-    save_queue_state()
-    socketio.emit("queue_update", {"queue": get_queue_summary()})
-    return jsonify({"status": "retry scheduled"})
-
-@app.route("/api/queue/pause", methods=["POST"])
-def api_pause_queue():
-    global queue_paused
-    queue_paused = True
-    # Stop active download
-    if active_download:
-        stop_current.set()
-    save_queue_state()
-    return jsonify({"status": "paused"})
-
-@app.route("/api/queue/resume", methods=["POST"])
-def api_resume_queue():
-    global queue_paused
-    queue_paused = False
-    save_queue_state()
-    return jsonify({"status": "resumed"})
-
-@app.route("/api/files", methods=["GET"])
-def api_files():
-    return jsonify(get_video_files())
-
-@app.route("/api/files/delete", methods=["POST"])
-def api_delete_file():
-    data = request.json
-    filename = data.get("filename")
-    if not filename:
-        return jsonify({"error": "No filename"}), 400
-    filepath = DOWNLOADS_DIR / filename
-    try:
-        if filepath.exists():
-            filepath.unlink()
-            return jsonify({"status": "deleted"})
-        else:
-            return jsonify({"error": "File not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/status", methods=["GET"])
-def api_status():
-    return jsonify(get_system_status())
-
-@app.route("/downloads/<path:filename>")
+@app.route('/downloads/<filename>')
 def serve_video(filename):
-    """Serve downloaded videos for playback."""
-    return send_from_directory(DOWNLOADS_DIR, filename, as_attachment=False)
+    return send_from_directory(Config.DOWNLOADS_DIR, filename, conditional=True)
 
-# ============================================================================
-#                               SOCKETIO EVENTS
-# ============================================================================
+@app.route('/api/system')
+def system_status():
+    import psutil
+    return jsonify({
+        'cpu': psutil.cpu_percent(),
+        'ram': psutil.virtual_memory().percent,
+        'disk': psutil.disk_usage('/').percent,
+        'queue_size': len(download_queue),
+        'active_downloads': len(active_downloads),
+        'uptime': time.time() - psutil.boot_time()
+    })
 
-@socketio.on("connect")
+# ─── SocketIO Events ────────────────────────────────────────────────────────
+@socketio.on('connect')
 def handle_connect():
-    logger.info("Client connected")
-    emit("connected", {"status": "ok"})
-    emit("queue_update", {"queue": get_queue_summary()})
+    emit('connected', {'status': 'ok'})
 
-@socketio.on("disconnect")
-def handle_disconnect():
-    logger.info("Client disconnected")
-
-# ============================================================================
-#                               MAIN ENTRY POINT
-# ============================================================================
-
-start_time = time.time()
-
-def main():
-    global queue_worker_thread, should_exit
-    # Load previous queue
-    load_queue_state()
-    # Start queue worker thread
-    queue_worker_thread = threading.Thread(target=queue_worker, daemon=True)
-    queue_worker_thread.start()
-    # Start Flask-SocketIO
-    try:
-        socketio.run(app, host="0.0.0.0", port=5000, debug=False, allow_unsafe_werkzeug=True)
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        should_exit = True
-        if queue_worker_thread:
-            queue_worker_thread.join(timeout=2)
-        save_queue_state()
-        sys.exit(0)
-
-if __name__ == "__main__":
-    main()
-
-# ============================================================================
-#                               EMBEDDED HTML/CSS/JS
-# ============================================================================
-
-HTML_TEMPLATE = """
+# ─── HTML Template (embedded) ──────────────────────────────────────────────
+HTML_TEMPLATE = r'''
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-    <title>VPlayer | Enterprise Media Platform</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>وی‌پلیر | Video Manager Enterprise</title>
+    <link rel="stylesheet" href="/static/vendor/bootstrap/css/bootstrap.min.css">
+    <link rel="stylesheet" href="/static/vendor/fontawesome/css/all.min.css">
+    <link rel="stylesheet" href="/static/vendor/fonts/Vazirmatn.css" onerror="this.onerror=null;this.href=''">
     <style>
-        /* ---------- GLOBAL RESET & VARIABLES ---------- */
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        :root {
-            --bg-dark: #0b0c0e;
-            --bg-card: rgba(20, 22, 27, 0.85);
-            --border-glow: rgba(0, 255, 200, 0.3);
-            --accent: #00e5c0;
-            --accent-glow: 0 0 8px rgba(0, 229, 192, 0.6);
-            --text-main: #f0f3f8;
-            --text-dim: #8b93a7;
-            --danger: #ff4d6d;
-            --success: #00d26a;
-            --warning: #ffb347;
-            --radius: 16px;
-            --transition: all 0.2s ease;
-        }
-
-        body {
-            background: radial-gradient(circle at 20% 30%, #14161c, #0b0c0e);
-            font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-            color: var(--text-main);
-            padding: 0;
-            margin: 0;
-            line-height: 1.5;
-        }
-
-        /* Custom scrollbar */
-        ::-webkit-scrollbar {
-            width: 6px;
-            height: 6px;
-        }
-        ::-webkit-scrollbar-track {
-            background: #1e2028;
-            border-radius: 10px;
-        }
-        ::-webkit-scrollbar-thumb {
-            background: var(--accent);
-            border-radius: 10px;
-        }
-
-        /* Typography */
-        h1, h2, h3 {
-            font-weight: 600;
-            letter-spacing: -0.02em;
-        }
-        a {
-            text-decoration: none;
-            color: inherit;
-        }
-
-        /* ---------- GLASS PANEL ---------- */
-        .glass-panel {
-            background: var(--bg-card);
-            backdrop-filter: blur(16px);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: var(--radius);
-            box-shadow: 0 12px 30px rgba(0,0,0,0.3);
-            transition: var(--transition);
-        }
-
-        /* ---------- NAVBAR ---------- */
-        .navbar {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 1rem 2rem;
-            background: rgba(8, 10, 14, 0.8);
-            backdrop-filter: blur(12px);
-            border-bottom: 1px solid rgba(0,229,192,0.2);
-            position: sticky;
-            top: 0;
-            z-index: 100;
-        }
-        .logo {
-            font-size: 1.6rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, #fff, var(--accent));
-            -webkit-background-clip: text;
-            background-clip: text;
-            color: transparent;
-        }
-        .status-badge {
-            display: flex;
-            gap: 1.2rem;
-            background: rgba(0,0,0,0.5);
-            padding: 0.4rem 1rem;
-            border-radius: 40px;
-            font-size: 0.8rem;
-        }
-        .status-badge span {
-            color: var(--text-dim);
-        }
-        .status-badge i {
-            color: var(--accent);
-            font-weight: bold;
-        }
-
-        /* ---------- MAIN TABS ---------- */
-        .tabs {
-            display: flex;
-            gap: 0.5rem;
-            padding: 1rem 2rem 0 2rem;
-            border-bottom: 1px solid rgba(255,255,255,0.05);
-        }
-        .tab-btn {
-            background: transparent;
-            border: none;
-            padding: 0.6rem 1.4rem;
-            font-weight: 500;
-            font-size: 0.9rem;
-            color: var(--text-dim);
-            cursor: pointer;
-            border-radius: 40px;
-            transition: var(--transition);
-        }
-        .tab-btn.active {
-            background: rgba(0,229,192,0.12);
-            color: var(--accent);
-            backdrop-filter: blur(4px);
-        }
-        .tab-content {
-            display: none;
-            padding: 2rem;
-            animation: fadeIn 0.3s ease;
-        }
-        .tab-content.active {
-            display: block;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(8px);}
-            to { opacity: 1; transform: translateY(0);}
-        }
-
-        /* ---------- FORMS & INPUTS ---------- */
-        .input-group {
-            display: flex;
-            gap: 0.8rem;
-            margin-top: 1rem;
-            flex-wrap: wrap;
-        }
-        input, textarea, select {
-            background: #1a1c23;
-            border: 1px solid #2a2d36;
-            border-radius: 14px;
-            padding: 0.8rem 1rem;
-            color: white;
-            font-size: 0.9rem;
-            transition: var(--transition);
-        }
-        input:focus, textarea:focus, select:focus {
-            outline: none;
-            border-color: var(--accent);
-            box-shadow: 0 0 0 2px rgba(0,229,192,0.2);
-        }
-        textarea {
-            width: 100%;
-            min-height: 120px;
-            font-family: monospace;
-        }
-        button {
-            background: var(--accent);
-            border: none;
-            border-radius: 40px;
-            padding: 0.6rem 1.4rem;
-            font-weight: 600;
-            color: #0b0c0e;
-            cursor: pointer;
-            transition: var(--transition);
-        }
-        button.secondary {
-            background: #2a2d36;
-            color: white;
-        }
-        button.danger {
-            background: var(--danger);
-            color: white;
-        }
-        button:hover {
-            transform: translateY(-2px);
-            filter: brightness(1.05);
-        }
-
-        /* Queue cards */
-        .queue-list {
-            margin-top: 1.5rem;
-            display: flex;
-            flex-direction: column;
-            gap: 0.8rem;
-        }
-        .queue-item {
-            background: rgba(26,28,35,0.7);
-            border-radius: 20px;
-            padding: 1rem;
-            border-left: 4px solid var(--accent);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-        }
-        .queue-progress {
-            flex: 2;
-            min-width: 150px;
-        }
-        .progress-bar {
-            background: #2a2d36;
-            border-radius: 10px;
-            height: 8px;
-            width: 100%;
-            overflow: hidden;
-        }
-        .progress-fill {
-            background: linear-gradient(90deg, var(--accent), #00a88f);
-            width: 0%;
-            height: 100%;
-            border-radius: 10px;
-        }
-        /* Video grid */
-        .video-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-            gap: 1.2rem;
-            margin-top: 1.5rem;
-        }
-        .video-card {
-            background: #1a1c23;
-            border-radius: 18px;
-            padding: 0.8rem;
-            transition: var(--transition);
-        }
-        .video-card:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 10px 20px rgba(0,0,0,0.4);
-        }
-        /* Stats */
-        .stats-grid {
-            display: flex;
-            gap: 1.2rem;
-            flex-wrap: wrap;
-            margin-bottom: 2rem;
-        }
-        .stat-box {
-            background: #1a1c23;
-            border-radius: 24px;
-            padding: 1rem 1.6rem;
-            text-align: center;
-            flex: 1;
-        }
-        @media (max-width: 680px) {
-            .tabs { padding: 0.5rem; overflow-x: auto; }
-            .tab-btn { padding: 0.4rem 1rem; font-size: 0.8rem; }
-            .tab-content { padding: 1rem; }
-        }
-        video {
-            width: 100%;
-            border-radius: 16px;
-            background: black;
-        }
+        {{ CSS | safe }}
     </style>
-    <script src="/socket.io/socket.io.js"></script>
-    <script>
-        // ---------- GLOBALS ----------
-        let socket = io();
-        let currentQueue = [];
-
-        // Helper: format bytes
-        function formatBytes(bytes) {
-            if (!bytes) return "0 B";
-            const k = 1024;
-            const sizes = ["B", "KB", "MB", "GB"];
-            let i = Math.floor(Math.log(bytes) / Math.log(k));
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
-        }
-
-        // Refresh queue UI
-        function renderQueue() {
-            const container = document.getElementById("queueContainer");
-            if (!container) return;
-            if (!currentQueue.length) {
-                container.innerHTML = `<div class="glass-panel" style="padding:2rem; text-align:center;">🎯 No items in queue. Add URLs to start.</div>`;
-                return;
-            }
-            container.innerHTML = currentQueue.map(item => {
-                let statusClass = "";
-                let statusText = item.status.toUpperCase();
-                if (item.status === "waiting") statusClass = "🕒";
-                else if (item.status === "downloading") statusClass = "⬇️";
-                else if (item.status === "uploading") statusClass = "☁️";
-                else if (item.status === "completed") statusClass = "✅";
-                else if (item.status === "uploaded") statusClass = "🚀";
-                else if (item.status === "failed") statusClass = "❌";
-                return `
-                    <div class="queue-item" data-id="${item.id}">
-                        <div style="flex:2">
-                            <strong>${escapeHtml(item.title || item.url.substring(0,60))}</strong>
-                            <div class="queue-progress">
-                                <div class="progress-bar"><div class="progress-fill" style="width:${item.progress || 0}%"></div></div>
-                                <small>${statusClass} ${statusText}  |  ${item.speed ? formatBytes(item.speed)+'/s' : ''}  ${item.eta ? 'ETA: '+item.eta : ''}</small>
-                                ${item.error ? `<div style="color:var(--danger); font-size:0.7rem;">⚠️ ${item.error}</div>` : ''}
-                            </div>
-                        </div>
-                        <div style="display:flex; gap:8px;">
-                            ${item.status === "failed" ? `<button class="secondary" onclick="retryItem('${item.id}')">⟳ Retry</button>` : ''}
-                            <button class="danger" onclick="removeItem('${item.id}')">🗑</button>
-                        </div>
-                    </div>
-                `;
-            }).join('');
-        }
-
-        function escapeHtml(str) { if(!str) return ''; return str.replace(/[&<>]/g, function(m){if(m==='&') return '&amp;'; if(m==='<') return '&lt;'; if(m==='>') return '&gt;'; return m;}); }
-
-        async function fetchQueue() {
-            const res = await fetch('/api/queue');
-            currentQueue = await res.json();
-            renderQueue();
-            document.getElementById("queueCount").innerText = currentQueue.length;
-        }
-
-        async function fetchFiles() {
-            const res = await fetch('/api/files');
-            const files = await res.json();
-            const grid = document.getElementById("videoGrid");
-            if (!grid) return;
-            if (!files.length) {
-                grid.innerHTML = `<div class="glass-panel" style="padding:2rem; text-align:center;">📁 No videos downloaded yet.</div>`;
-                return;
-            }
-            grid.innerHTML = files.map(v => `
-                <div class="video-card">
-                    <video controls preload="metadata" style="max-height:160px; object-fit:cover;"><source src="${v.path}" type="video/mp4"></video>
-                    <div style="margin-top:8px;"><strong>${escapeHtml(v.name)}</strong></div>
-                    <div style="font-size:0.7rem; color:var(--text-dim);">${formatBytes(v.size)}</div>
-                    <div style="display:flex; gap:8px; margin-top:8px;">
-                        <button onclick="playVideo('${v.path}')">▶ Play</button>
-                        <button class="danger" onclick="deleteFile('${v.name}')">Delete</button>
-                    </div>
-                </div>
-            `).join('');
-        }
-
-        async function fetchStatus() {
-            const res = await fetch('/api/status');
-            const data = await res.json();
-            document.getElementById("statCpu").innerText = data.cpu + "%";
-            document.getElementById("statRam").innerText = data.ram + "%";
-            document.getElementById("statDisk").innerText = data.disk + "%";
-            document.getElementById("statQueue").innerText = data.waiting + " waiting";
-        }
-
-        // Queue actions
-        async function addToQueue() {
-            const textarea = document.getElementById("bulkUrls");
-            const urls = textarea.value.split('\\n').filter(u => u.trim().startsWith('http'));
-            if(!urls.length) { alert("Enter at least one valid URL"); return; }
-            const res = await fetch('/api/queue/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({urls})});
-            if(res.ok) {
-                textarea.value = '';
-                fetchQueue();
-            }
-        }
-
-        async function removeItem(id) {
-            await fetch(`/api/queue/remove/${id}`, {method:'DELETE'});
-            fetchQueue();
-        }
-
-        async function retryItem(id) {
-            await fetch(`/api/queue/retry/${id}`, {method:'POST'});
-            fetchQueue();
-        }
-
-        async function pauseQueue() { await fetch('/api/queue/pause', {method:'POST'}); fetchQueue(); }
-        async function resumeQueue() { await fetch('/api/queue/resume', {method:'POST'}); fetchQueue(); }
-
-        async function deleteFile(filename) {
-            if(!confirm(`Delete ${filename}?`)) return;
-            await fetch('/api/files/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filename})});
-            fetchFiles();
-        }
-
-        function playVideo(path) {
-            const playerContainer = document.getElementById("playerContainer");
-            if(playerContainer) {
-                playerContainer.innerHTML = `<video controls autoplay style="width:100%; border-radius:16px;"><source src="${path}" type="video/mp4"></video>`;
-                document.getElementById("singlePlayerTab").click(); // switch to player tab
-            }
-        }
-
-        // Socket listeners
-        socket.on('queue_update', (data) => { fetchQueue(); fetchStatus(); });
-        socket.on('progress', (data) => { fetchQueue(); });
-        socket.on('upload_progress', (data) => { fetchQueue(); });
-
-        // Tab switching
-        function switchTab(tabId) {
-            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.getElementById(tabId + 'Tab').classList.add('active');
-            document.querySelector(`[data-tab="${tabId}"]`).classList.add('active');
-            if(tabId === 'files') fetchFiles();
-            if(tabId === 'status') fetchStatus();
-        }
-
-        window.onload = () => {
-            fetchQueue();
-            fetchFiles();
-            fetchStatus();
-            setInterval(() => { fetchStatus(); }, 4000);
-            // Drag & drop reorder (simplified: will not implement full drag due to complexity, but API ready)
-            document.getElementById("bulkAddBtn").onclick = addToQueue;
-            document.getElementById("pauseQueueBtn").onclick = pauseQueue;
-            document.getElementById("resumeQueueBtn").onclick = resumeQueue;
-        };
-    </script>
 </head>
 <body>
-    <nav class="navbar">
-        <div class="logo">🎬 VPLAYER</div>
-        <div class="status-badge">
-            <span>📦 Queue: <span id="queueCount">0</span></span>
-            <span>⚡ Online</span>
-        </div>
-    </nav>
-    <div class="tabs">
-        <button class="tab-btn active" data-tab="single" onclick="switchTab('single')">📥 Single Download</button>
-        <button class="tab-btn" data-tab="bulk" onclick="switchTab('bulk')">📋 Queue Download</button>
-        <button class="tab-btn" data-tab="queueView" onclick="switchTab('queueView')">⏯ Queue Manager</button>
-        <button class="tab-btn" data-tab="files" onclick="switchTab('files')">🗂 File Manager</button>
-        <button class="tab-btn" data-tab="status" onclick="switchTab('status')">📊 System Status</button>
-        <button class="tab-btn" data-tab="player" onclick="switchTab('player')">🎮 Media Player</button>
-    </div>
-
-    <!-- Single Download Tab -->
-    <div id="singleTab" class="tab-content active">
-        <div class="glass-panel" style="max-width:700px; margin:0 auto; padding:1.8rem;">
-            <h3>⚡ Quick Download</h3>
-            <div class="input-group">
-                <input type="text" id="singleUrl" placeholder="https://youtube.com/watch?v=..." style="flex:1">
-                <button id="singleDownloadBtn">Download</button>
+    <div id="app">
+        <!-- Navbar -->
+        <nav class="navbar">
+            <div class="nav-brand">وی‌پلیر</div>
+            <div class="nav-stats">
+                <span><i class="fas fa-download"></i> <span id="active-count">0</span></span>
+                <span><i class="fas fa-server"></i> <span id="sys-status">Online</span></span>
             </div>
-            <div id="singleStatus"></div>
+        </nav>
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab active" data-tab="single">Single Download</button>
+            <button class="tab" data-tab="queue">Queue Download</button>
+            <button class="tab" data-tab="files">File Manager</button>
+            <button class="tab" data-tab="system">System Status</button>
         </div>
-    </div>
-
-    <!-- Bulk Queue Tab -->
-    <div id="bulkTab" class="tab-content">
-        <div class="glass-panel" style="max-width:800px; margin:0 auto;">
-            <h3>➕ Add Multiple URLs</h3>
-            <textarea id="bulkUrls" placeholder="https://...&#10;https://...&#10;one per line"></textarea>
-            <div class="input-group">
-                <button id="bulkAddBtn">Add to Queue</button>
-                <button id="pauseQueueBtn" class="secondary">⏸ Pause Queue</button>
-                <button id="resumeQueueBtn" class="secondary">▶ Resume</button>
+        <!-- Tab contents -->
+        <div id="tab-single" class="tab-content active">
+            <!-- Single download form -->
+            <div class="card">
+                <h2>Download Video</h2>
+                <form id="single-dl-form">
+                    <div class="input-group">
+                        <input type="url" id="single-url" placeholder="https://www.youtube.com/watch?v=..." required>
+                        <button type="submit" class="btn btn-primary"><i class="fas fa-download"></i> Download</button>
+                    </div>
+                </form>
+                <div id="single-progress" style="display:none;">
+                    <div class="progress-bar"><div class="progress-fill" id="single-bar"></div></div>
+                    <div class="info"><span id="single-status"></span> - <span id="single-speed"></span> - <span id="single-eta"></span></div>
+                    <button id="single-stop" class="btn btn-danger">Stop</button>
+                </div>
             </div>
         </div>
-    </div>
-
-    <!-- Queue Manager Tab -->
-    <div id="queueViewTab" class="tab-content">
-        <div class="glass-panel">
-            <h3>📋 Download Queue (sequential)</h3>
-            <div id="queueContainer" class="queue-list"></div>
+        <div id="tab-queue" class="tab-content">
+            <div class="card">
+                <h2>Queue Download</h2>
+                <textarea id="queue-urls" rows="5" placeholder="Enter one URL per line..."></textarea>
+                <button id="queue-add" class="btn btn-primary"><i class="fas fa-plus"></i> Add to Queue</button>
+                <div id="queue-list"></div>
+            </div>
         </div>
-    </div>
-
-    <!-- File Manager Tab -->
-    <div id="filesTab" class="tab-content">
-        <div class="glass-panel">
-            <h3>🗂 Downloaded Media</h3>
-            <div id="videoGrid" class="video-grid"></div>
+        <div id="tab-files" class="tab-content">
+            <div class="card">
+                <h2>Downloaded Files</h2>
+                <div id="file-list"></div>
+            </div>
         </div>
-    </div>
-
-    <!-- System Status Tab -->
-    <div id="statusTab" class="tab-content">
-        <div class="glass-panel">
-            <h3>📈 Real-time Metrics</h3>
-            <div class="stats-grid">
-                <div class="stat-box">🧠 CPU <br><span id="statCpu">--</span></div>
-                <div class="stat-box">💾 RAM <br><span id="statRam">--</span></div>
-                <div class="stat-box">💽 Disk <br><span id="statDisk">--</span></div>
-                <div class="stat-box">⏳ Queue <br><span id="statQueue">--</span></div>
+        <div id="tab-system" class="tab-content">
+            <div class="card">
+                <h2>System Status</h2>
+                <div id="sys-info"></div>
             </div>
         </div>
     </div>
-
-    <!-- Media Player Tab -->
-    <div id="playerTab" class="tab-content">
-        <div class="glass-panel">
-            <h3>🎬 Premium Player</h3>
-            <div id="playerContainer">
-                <video controls style="width:100%; border-radius:16px;">
-                    <source src="" type="video/mp4">
-                    Your browser does not support the video tag.
-                </video>
-            </div>
-            <p style="margin-top:12px;">Select a video from File Manager to play here.</p>
-        </div>
-    </div>
-
+    <script src="/static/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
+    <script src="/static/vendor/socketio/socket.io.min.js"></script>
     <script>
-        // Single download using queue system (adds to queue)
-        document.getElementById("singleDownloadBtn").onclick = async () => {
-            const url = document.getElementById("singleUrl").value.trim();
-            if(!url) return;
-            const res = await fetch('/api/queue/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({urls:[url]})});
-            if(res.ok) {
-                document.getElementById("singleStatus").innerHTML = "✅ Added to queue";
-                setTimeout(()=>document.getElementById("singleStatus").innerHTML="", 2000);
-                document.getElementById("singleUrl").value = "";
-                fetchQueue();
-                switchTab('queueView');
-            } else alert("Error adding URL");
-        };
-        // refresh queue after socket events
-        window.fetchQueue = fetchQueue;
-        window.removeItem = removeItem;
-        window.retryItem = retryItem;
-        window.deleteFile = deleteFile;
-        window.playVideo = playVideo;
-        window.switchTab = switchTab;
+        {{ JS | safe }}
     </script>
 </body>
 </html>
-"""
+'''
+
+# ─── CSS Section (embedded) ─────────────────────────────────────────────────
+CSS = '''
+:root {
+    --bg: #0b0f19;
+    --card-bg: rgba(18, 22, 33, 0.8);
+    --text: #e2e8f0;
+    --primary: #6366f1;
+    --secondary: #818cf8;
+    --accent: #a78bfa;
+    --danger: #ef4444;
+    --success: #10b981;
+    --glass: rgba(255, 255, 255, 0.05);
+    --border: rgba(255, 255, 255, 0.1);
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: 'Vazirmatn', 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height:100vh; }
+.navbar { display:flex; justify-content:space-between; align-items:center; padding:1rem 2rem; background: rgba(10,14,23,0.9); backdrop-filter:blur(15px); border-bottom:1px solid var(--border); }
+.nav-brand { font-size:1.8rem; font-weight:bold; background: linear-gradient(135deg, var(--primary), var(--accent)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+.nav-stats span { margin-left:1.5rem; font-size:0.9rem; }
+.tabs { display:flex; gap:0.5rem; padding:1.5rem 2rem 0; }
+.tab { padding:0.8rem 1.5rem; background: transparent; border:1px solid var(--border); border-radius:8px 8px 0 0; color: var(--text); cursor:pointer; transition: all 0.3s; }
+.tab.active { background: var(--primary); border-color: var(--primary); color: white; }
+.tab-content { display:none; padding:2rem; }
+.tab-content.active { display:block; }
+.card { background: var(--card-bg); backdrop-filter:blur(12px); border:1px solid var(--border); border-radius:16px; padding:2rem; margin-bottom:2rem; }
+.input-group { display:flex; gap:1rem; margin:1rem 0; }
+input, textarea { flex:1; padding:0.8rem; background: rgba(255,255,255,0.05); border:1px solid var(--border); border-radius:8px; color:var(--text); }
+.btn { padding:0.8rem 1.5rem; border:none; border-radius:8px; font-weight:600; cursor:pointer; transition:0.3s; }
+.btn-primary { background: var(--primary); color:white; }
+.btn-primary:hover { background: var(--secondary); }
+.btn-danger { background: var(--danger); color:white; }
+.progress-bar { height:8px; background: rgba(255,255,255,0.1); border-radius:4px; overflow:hidden; margin:1rem 0; }
+.progress-fill { height:100%; background: linear-gradient(90deg, var(--primary), var(--accent)); width:0%; transition: width 0.3s; }
+.info { font-size:0.9rem; opacity:0.8; }
+#queue-list, #file-list { margin-top:1.5rem; }
+.queue-item, .file-item { display:flex; justify-content:space-between; align-items:center; padding:1rem; background: rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; margin-bottom:0.5rem; }
+.status-dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-left:0.5rem; }
+'''
+
+# ─── JavaScript Section (embedded) ──────────────────────────────────────────
+JS = '''
+const socket = io();
+let currentTab = 'single';
+
+// Tab switching
+document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const id = 'tab-' + tab.dataset.tab;
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+        if (tab.dataset.tab === 'files') loadFiles();
+        if (tab.dataset.tab === 'system') loadSystem();
+        if (tab.dataset.tab === 'queue') loadQueue();
+    });
+});
+
+// Single download
+document.getElementById('single-dl-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const url = document.getElementById('single-url').value;
+    const sid = generateUUID();
+    // add to queue as well (single downloads also go through queue)
+    socket.emit('add_to_queue', {urls: [url], sid: sid});
+    // Show progress
+    document.getElementById('single-progress').style.display = 'block';
+    // Update UI via socket events later
+});
+
+socket.on('progress', (data) => {
+    if (data.sid === currentDownloadSid) {
+        document.getElementById('single-bar').style.width = data.percent + '%';
+        document.getElementById('single-status').textContent = data.status;
+        document.getElementById('single-speed').textContent = data.speed;
+        document.getElementById('single-eta').textContent = data.eta;
+    }
+});
+
+// Queue management
+document.getElementById('queue-add').addEventListener('click', () => {
+    const urls = document.getElementById('queue-urls').value;
+    fetch('/api/queue/add', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'urls=' + encodeURIComponent(urls)
+    }).then(r=>r.json()).then(d=>{ if(d.added) loadQueue(); });
+});
+
+function loadQueue() {
+    fetch('/api/queue/status').then(r=>r.json()).then(items => {
+        const html = items.map(item => `
+            <div class="queue-item">
+                <span><span class="status-dot" style="background:${getStatusColor(item.status)}"></span>${item.url || item.filename}</span>
+                <span>${item.status} ${item.progress ? Math.round(item.progress)+'%' : ''}</span>
+                <button class="btn btn-sm btn-danger" onclick="stopQueue('${item.id}')">Stop</button>
+            </div>
+        `).join('');
+        document.getElementById('queue-list').innerHTML = html;
+    });
+}
+
+function stopQueue(sid) {
+    fetch('/api/queue/stop/' + sid, {method:'POST'}).then(()=>loadQueue());
+}
+
+function getStatusColor(s) {
+    switch(s) {
+        case 'downloading': return '#f59e0b';
+        case 'completed': case 'uploaded': return '#10b981';
+        case 'failed': case 'upload_failed': return '#ef4444';
+        default: return '#6b7280';
+    }
+}
+
+function loadFiles() {
+    fetch('/api/videos').then(r=>r.json()).then(files => {
+        const html = files.map(f => `
+            <div class="file-item">
+                <span>${f.name} (${(f.size/1024/1024).toFixed(2)} MB)</span>
+                <div>
+                    <a href="/downloads/${f.name}" target="_blank" class="btn btn-sm btn-primary">Play</a>
+                    <a href="/downloads/${f.name}" download class="btn btn-sm btn-secondary">Download</a>
+                </div>
+            </div>
+        `).join('');
+        document.getElementById('file-list').innerHTML = html;
+    });
+}
+
+function loadSystem() {
+    fetch('/api/system').then(r=>r.json()).then(data => {
+        document.getElementById('sys-info').innerHTML = `
+            CPU: ${data.cpu}%<br>
+            RAM: ${data.ram}%<br>
+            Disk: ${data.disk}%<br>
+            Queue: ${data.queue_size}<br>
+            Active: ${data.active_downloads}
+        `;
+    });
+}
+
+function generateUUID() { return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random()*16|0, v = c=='x'?r:(r&0x3|0x8); return v.toString(16); }); }
+'''
+
+# ─── Main Entry Point ───────────────────────────────────────────────────────
+if __name__ == '__main__':
+    logger.info("Starting Enterprise Video Manager...")
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
