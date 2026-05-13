@@ -1,0 +1,322 @@
+name: 🎬 دانلود ویدیو و ذخیره در ریپازیتوری
+
+on:
+  workflow_dispatch:
+    inputs:
+      activation_code:
+        description: '🔑 کد فعالسازی (فقط برای بار اول نیاز است)'
+        required: false
+        default: ''
+        type: string
+      video_url:
+        description: '🔗 لینک ویدیو (یوتیوب، آپارات، و...)'
+        required: true
+        type: string
+      format:
+        description: '📺 کیفیت ویدیو'
+        required: false
+        default: 'best[height<=720]'
+        type: choice
+        options:
+          - 'best[height<=720]'
+          - 'best[height<=1080]'
+          - 'best'
+          - 'worst'
+      mode:
+        description: '📦 حالت ذخیره‌سازی'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - zip
+      password:
+        description: '🔒 رمز عبور برای فایل زیپ (اختیاری)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  CODES_URL: "https://raw.githubusercontent.com/keepfiless/activate/refs/heads/main/checklist/ul.txt"
+
+jobs:
+  check-activation:
+    name: "🔍 بررسی فعالسازی"
+    runs-on: ubuntu-latest
+    outputs:
+      is_activated: ${{ steps.check.outputs.is_activated }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore activation cache
+        id: cache-activation
+        uses: actions/cache@v4
+        with:
+          path: .activation-status
+          key: activation-status-${{ github.repository }}
+
+      - name: Check activation status
+        id: check
+        run: |
+          if [ -f ".activation-status/act.txt" ]; then
+            ACT_STATUS=$(cat .activation-status/act.txt 2>/dev/null || echo "")
+            if [ "$ACT_STATUS" = "1" ]; then
+              echo "is_activated=true" >> $GITHUB_OUTPUT
+              echo "✅ وضعیت: فعال شده"
+            else
+              echo "is_activated=false" >> $GITHUB_OUTPUT
+              echo "🔒 وضعیت: فعال نشده"
+            fi
+          else
+            echo "is_activated=false" >> $GITHUB_OUTPUT
+            echo "🔒 وضعیت: فعال نشده"
+          fi
+
+  activate:
+    name: "🔐 فعالسازی با کد"
+    needs: check-activation
+    if: needs.check-activation.outputs.is_activated == 'false' && github.event.inputs.activation_code != ''
+    runs-on: ubuntu-latest
+    outputs:
+      just_activated: ${{ steps.validate.outputs.valid }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch and validate activation code
+        id: validate
+        run: |
+          INPUT_CODE="${{ github.event.inputs.activation_code }}"
+          curl -sL "${{ env.CODES_URL }}" | tr -d '\r' | grep -v '^$' > /tmp/raw_codes.txt
+
+          # Extract last 4 characters of each valid code
+          > /tmp/valid_codes.txt
+          while IFS= read -r code; do
+            if [ ${#code} -gt 4 ]; then
+              echo "${code: -4}" >> /tmp/valid_codes.txt
+            else
+              echo "$code" >> /tmp/valid_codes.txt
+            fi
+          done < /tmp/raw_codes.txt
+
+          if [ ${#INPUT_CODE} -gt 4 ]; then
+            INPUT_CODE_LAST4="${INPUT_CODE: -4}"
+          else
+            INPUT_CODE_LAST4="$INPUT_CODE"
+          fi
+
+          if grep -qx "$INPUT_CODE_LAST4" /tmp/valid_codes.txt; then
+            echo "valid=true" >> $GITHUB_OUTPUT
+            echo "✅ کد فعالسازی معتبر است!"
+          else
+            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "❌ کد فعالسازی نامعتبر است!"
+            exit 1
+          fi
+
+      - name: Save activation to cache
+        if: steps.validate.outputs.valid == 'true'
+        run: |
+          mkdir -p .activation-status
+          echo "1" > .activation-status/act.txt
+          echo "activated_at=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> .activation-status/info.txt
+          echo "activated_by=${{ github.actor }}" >> .activation-status/info.txt
+
+      - name: Cache activation status
+        if: steps.validate.outputs.valid == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .activation-status
+          key: activation-status-${{ github.repository }}
+
+  save-video:
+    name: "📥 دانلود ویدیو و ذخیره در مخزن"
+    needs: [check-activation, activate]
+    if: always() && !cancelled() && (needs.check-activation.outputs.is_activated == 'true' || needs.activate.outputs.just_activated == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - name: Check video URL
+        run: |
+          if [ -z "${{ github.event.inputs.video_url }}" ]; then
+            echo "❌ لینک ویدیو وارد نشده است!"
+            exit 1
+          fi
+          echo "✅ لینک ویدیو: ${{ github.event.inputs.video_url }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git for large files
+        run: |
+          git config --global http.postBuffer 524288000
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install dependencies (yt-dlp, zip, aria2)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip zip aria2 curl bc
+          pip3 install yt-dlp
+
+      - name: Download video with yt-dlp
+        id: download
+        run: |
+          VIDEO_URL="${{ github.event.inputs.video_url }}"
+          FORMAT="${{ github.event.inputs.format }}"
+          
+          # Download video
+          yt-dlp \
+            --format "$FORMAT" \
+            --no-playlist \
+            --output "original_video.%(ext)s" \
+            "$VIDEO_URL"
+          
+          # Get the actual filename
+          ORIGINAL_FILE=$(ls original_video.* | head -n1)
+          if [ ! -f "$ORIGINAL_FILE" ]; then
+            echo "❌ فایل ویدیو پیدا نشد!"
+            exit 1
+          fi
+          
+          echo "original_file=$ORIGINAL_FILE" >> $GITHUB_OUTPUT
+          FILE_SIZE=$(stat -c%s "$ORIGINAL_FILE")
+          SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+          echo "حجم فایل: ${SIZE_MB} MB"
+          echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
+
+      - name: Prepare video for repository (split if needed)
+        run: |
+          ORIGINAL_FILE="${{ steps.download.outputs.original_file }}"
+          FILE_SIZE=${{ steps.download.outputs.file_size }}
+          MODE="${{ github.event.inputs.mode }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
+          
+          SPLIT_THRESHOLD_MB=95   # GitHub limit is 100MB, use 95 to be safe
+          SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
+          
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+          
+          mkdir -p downloads
+          BASE_NAME=$(basename "$ORIGINAL_FILE" | sed 's/\.[^.]*$//')
+          EXT="${ORIGINAL_FILE##*.}"
+          
+          # Function to URL encode
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+          
+          if [ "$MODE" = "zip" ] || [ "$FILE_SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
+            echo "Creating zip archive (split if needed)..."
+            mkdir -p "downloads/${BASE_NAME}"
+            
+            if [ "$FILE_SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
+              # Split into parts
+              if [ -n "$ZIP_PASSWORD" ]; then
+                zip -j -P "$ZIP_PASSWORD" -s ${SPLIT_THRESHOLD_MB}m \
+                  "downloads/${BASE_NAME}/${BASE_NAME}.zip" "$ORIGINAL_FILE"
+              else
+                zip -j -s ${SPLIT_THRESHOLD_MB}m \
+                  "downloads/${BASE_NAME}/${BASE_NAME}.zip" "$ORIGINAL_FILE"
+              fi
+              
+              # Generate README with download links
+              cat > "downloads/${BASE_NAME}/README.md" <<EOF
+# ${BASE_NAME}
+
+فایل ویدیو بزرگتر از ${SPLIT_THRESHOLD_MB} مگابایت است، بنابراین به چند بخش تقسیم شده است.
+
+## اطلاعات دانلود
+
+| ویژگی | مقدار |
+|-------|-------|
+| فایل اصلی | \`${ORIGINAL_FILE}\` |
+| تعداد بخش‌ها | $(ls downloads/${BASE_NAME}/*.zip downloads/${BASE_NAME}/*.z[0-9]* 2>/dev/null | wc -l) |
+| رمز عبور | $(if [ -n "$ZIP_PASSWORD" ]; then echo "دارد"; else echo "ندارد"; fi) |
+
+## لینک‌های دانلود بخش‌ها
+
+$(for part in downloads/${BASE_NAME}/*.zip downloads/${BASE_NAME}/*.z[0-9]*; do
+  [ -f "$part" ] || continue
+  PART_NAME=$(basename "$part")
+  PART_ENCODED=$(urlencode "$PART_NAME")
+  echo "- \`${PART_NAME}\` : [دانلود](${PART_ENCODED})"
+done)
+
+## نحوه extract
+
+1. همه بخش‌ها را دانلود کنید.
+2. فایل \`${BASE_NAME}.zip\` را با نرم‌افزارهایی مثل WinRAR یا 7-Zip باز کنید.
+3. ویدیوی اصلی خارج می‌شود.
+
+---
+*تولید شده توسط [avasam.ir](https://avasam.ir)*
+EOF
+            else
+              # Single zip file
+              if [ -n "$ZIP_PASSWORD" ]; then
+                zip -j -P "$ZIP_PASSWORD" "downloads/${BASE_NAME}/${BASE_NAME}.zip" "$ORIGINAL_FILE"
+              else
+                zip -j "downloads/${BASE_NAME}/${BASE_NAME}.zip" "$ORIGINAL_FILE"
+              fi
+              
+              cat > "downloads/${BASE_NAME}/README.md" <<EOF
+# ${BASE_NAME}
+
+| ویژگی | مقدار |
+|-------|-------|
+| فایل | \`${BASE_NAME}.zip\` |
+| حجم اصلی | $(stat -c%s "$ORIGINAL_FILE" | awk '{printf "%.2f MB", $1/1024/1024}') |
+| رمز عبور | $(if [ -n "$ZIP_PASSWORD" ]; then echo "دارد"; else echo "ندارد"; fi) |
+
+[دانلود فایل](./${BASE_NAME}.zip)
+
+---
+*تولید شده توسط [avasam.ir](https://avasam.ir)*
+EOF
+            fi
+          else
+            # Direct copy (file is small enough)
+            echo "Copying file directly (under ${SPLIT_THRESHOLD_MB}MB)"
+            cp "$ORIGINAL_FILE" "downloads/${BASE_NAME}.${EXT}"
+            
+            cat > "downloads/README_${BASE_NAME}.md" <<EOF
+# ${BASE_NAME}
+
+- فایل: \`${BASE_NAME}.${EXT}\`
+- حجم: $(stat -c%s "$ORIGINAL_FILE" | awk '{printf "%.2f MB", $1/1024/1024}')
+- [دانلود مستقیم](${BASE_NAME}.${EXT})
+
+---
+*تولید شده توسط [avasam.ir](https://avasam.ir)*
+EOF
+          fi
+
+      - name: Commit and push to repository
+        run: |
+          git add downloads/
+          
+          if ! git diff --cached --quiet; then
+            git commit -m "🎬 افزودن ویدیو دانلود شده: ${{ github.event.inputs.video_url }} [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ ویدیو با موفقیت به ریپازیتوری اضافه شد."
+          else
+            echo "ℹ️ هیچ فایل جدیدی برای commit وجود ندارد."
+          fi
+
+      - name: Show final download link
+        run: |
+          echo "========================================="
+          echo "✅ ویدیو در ریپازیتوری ذخیره شد:"
+          echo "https://github.com/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
+          echo "========================================="
