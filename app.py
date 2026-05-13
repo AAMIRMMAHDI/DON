@@ -1,1247 +1,836 @@
 import os
-import threading
+import re
 import uuid
-from flask import Flask, render_template_string, request, jsonify, send_from_directory
-import yt_dlp
-from flask_socketio import SocketIO
+import threading
 import urllib.parse
+from flask import Flask, render_template_string, request, jsonify, send_from_directory
+from flask_socketio import SocketIO, emit
+import yt_dlp
 
-# تنظیم Flask و SocketIO
+# ====================== تنظیم اولیه ======================
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.urandom(24)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# ساخت پوشه‌های مورد نیاز
 BASE_DIR = os.path.dirname(__file__)
 STATIC_DIR = os.path.join(BASE_DIR, 'static')
 VIDEO_DIR = os.path.join(STATIC_DIR, 'videos')
 CSS_DIR = os.path.join(STATIC_DIR, 'css')
 JS_DIR = os.path.join(STATIC_DIR, 'js')
 FONTS_DIR = os.path.join(STATIC_DIR, 'fonts')
-os.makedirs(VIDEO_DIR, exist_ok=True)
-os.makedirs(CSS_DIR, exist_ok=True)
-os.makedirs(JS_DIR, exist_ok=True)
-os.makedirs(FONTS_DIR, exist_ok=True)
-
-# محتوای فایل‌های استاتیک
-INDEX_HTML = """
-<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🎬 وی‌پلیر | سرویس پخش و دانلود ویدیو</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link rel="stylesheet" href="/static/css/style.css">
-    <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-</head>
-<body>
-    <!-- Navigation -->
-    <nav class="navbar navbar-expand-lg navbar-dark neon-navbar">
-        <div class="container-fluid">
-            <a class="navbar-brand glow-text" href="#">
-                <i class="fas fa-play-circle me-2"></i>
-                وی‌پلیر
-            </a>
-            <div class="navbar-nav ms-auto">
-                <span class="nav-text">سرویس حرفه‌ای پخش و دانلود ویدیو</span>
-            </div>
-        </div>
-    </nav>
-
-    <!-- Main Container -->
-    <div class="container-fluid main-container px-0">
-        <!-- Download Section -->
-        <div class="download-section container">
-            <div class="section-header">
-                <h2 class="glow-text"><i class="fas fa-cloud-download-alt me-2"></i>دانلود ویدیو</h2>
-                <div class="header-decoration"></div>
-            </div>
-            <form id="download-form" class="download-form">
-                <div class="neon-input-group">
-                    <input type="text" id="url" class="form-control neon-input"
-                           placeholder="https://www.youtube.com/watch?v=...">
-                    <button type="submit" class="btn btn-primary neon-btn">
-                        <i class="fas fa-download me-2"></i>
-                        دانلود
-                    </button>
-                </div>
-            </form>
-
-            <!-- Progress Section -->
-            <div class="progress-section">
-                <div class="progress-info">
-                    <span id="status" class="status-text">آماده برای دانلود</span>
-                    <span id="progress-text" class="progress-text">0%</span>
-                </div>
-                <div class="progress neon-progress">
-                    <div class="progress-bar" id="progress-bar" role="progressbar" style="width: 0%" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
-                </div>
-            </div>
-
-            <div class="controls">
-                <button id="stop-btn" class="btn btn-danger neon-btn-danger" disabled>
-                    <i class="fas fa-stop me-2"></i>
-                    توقف دانلود
-                </button>
-            </div>
-        </div>
-
-        <!-- Stats Section -->
-        <div class="stats-section container">
-            <div class="row justify-content-center">
-                <div class="col-md-3 col-sm-6">
-                    <div class="stat-card">
-                        <div class="stat-icon">
-                            <i class="fas fa-hdd"></i>
-                        </div>
-                        <div class="stat-info">
-                            <h5 id="total-videos">0</h5>
-                            <span>تعداد ویدیوها</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-3 col-sm-6">
-                    <div class="stat-card">
-                        <div class="stat-icon">
-                            <i class="fas fa-bolt"></i>
-                        </div>
-                        <div class="stat-info">
-                            <h5 id="active-downloads">0</h5>
-                            <span>دانلود فعال</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="col-md-3 col-sm-6">
-                    <div class="stat-card">
-                        <div class="stat-icon">
-                            <i class="fas fa-check-circle"></i>
-                        </div>
-                        <div class="stat-info">
-                            <h5>آنلاین</h5>
-                            <span>وضعیت سرویس</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Player Section -->
-        <div class="player-section container">
-            <div class="section-header">
-                <h2 class="glow-text"><i class="fas fa-play-circle me-2"></i>پخش ویدیو</h2>
-                <div class="header-decoration"></div>
-            </div>
-
-            <div class="video-player-container">
-                <div class="custom-player">
-                    <video id="player" class="video-element" controls></video>
-                    <div class="custom-controls">
-                        <button class="control-btn" id="play-pause">
-                            <i class="fas fa-play"></i>
-                        </button>
-                        <div class="progress-container">
-                            <div class="progress-bar-container">
-                                <div id="progress-bar-video" class="progress-bar-video"></div>
-                            </div>
-                        </div>
-                        <div class="time-display">
-                            <span id="current-time">00:00</span> /
-                            <span id="duration">00:00</span>
-                        </div>
-                        <button class="control-btn" id="volume-btn">
-                            <i class="fas fa-volume-up"></i>
-                        </button>
-                        <input type="range" class="volume-slider" id="volume-slider" min="0" max="100" value="100">
-                        <button class="control-btn" id="fullscreen-btn">
-                            <i class="fas fa-expand"></i>
-                        </button>
-                    </div>
-                </div>
-
-                <div class="player-actions">
-                    <button class="btn btn-outline-primary neon-btn-outline" id="close-player">
-                        <i class="fas fa-times me-2"></i>
-                        بستن پخش کننده
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Video List Section -->
-        <div class="video-list-section container">
-            <div class="sidebar-header">
-                <h4 class="glow-text"><i class="fas fa-download me-2"></i>ویدیوهای دانلود شده</h4>
-                <button class="btn btn-sm btn-outline-primary refresh-btn" id="refresh-btn">
-                    <i class="fas fa-sync-alt"></i>
-                </button>
-            </div>
-            <div class="video-strip-container">
-                <div id="video-strip" class="video-strip"></div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Footer -->
-    <footer class="footer">
-        <div class="container-fluid">
-            <p>&copy; 2024 وی‌پلیر - سرویس حرفه‌ای پخش و دانلود ویدیو</p>
-        </div>
-    </footer>
-
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.0/socket.io.js"></script>
-    <script src="/static/js/script.js"></script>
-</body>
-</html>
-"""
-
-STYLE_CSS = """
-:root {
-    --neon-blue: #00f3ff;
-    --neon-purple: #9d00ff;
-    --neon-pink: #ff00ff;
-    --neon-green: #00ff88;
-    --dark-bg: #0a0a0f;
-    --darker-bg: #050508;
-    --card-bg: rgba(255, 255, 255, 0.05);
-    --glass-bg: rgba(255, 255, 255, 0.1);
-    --text-primary: #ffffff;
-    --text-secondary: #b0b0b0;
-}
-
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-}
-
-body {
-    font-family: 'Vazirmatn', sans-serif;
-    background: linear-gradient(135deg, var(--dark-bg) 0%, var(--darker-bg) 100%);
-    color: var(--text-primary);
-    min-height: 100vh;
-    overflow-x: hidden;
-}
-
-/* Navigation */
-.neon-navbar {
-    background: rgba(10, 10, 15, 0.95) !important;
-    backdrop-filter: blur(20px);
-    border-bottom: 1px solid rgba(0, 243, 255, 0.3);
-    box-shadow: 0 0 20px rgba(0, 243, 255, 0.2);
-    padding: 1rem 0;
-}
-
-.navbar-brand {
-    font-size: 1.8rem;
-    font-weight: 700;
-    background: linear-gradient(45deg, var(--neon-blue), var(--neon-purple));
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-}
-
-.nav-text {
-    color: var(--text-secondary);
-    font-size: 0.9rem;
-}
-
-/* Main Layout */
-.main-container {
-    min-height: calc(100vh - 120px);
-}
-
-/* Sections General */
-.download-section, .stats-section, .player-section, .video-list-section {
-    background: var(--card-bg);
-    backdrop-filter: blur(20px);
-    border-radius: 20px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-    margin: 2rem auto;
-    padding: 2rem;
-    max-width: 1400px;
-}
-
-.section-header {
-    margin-bottom: 2rem;
-    text-align: center;
-}
-
-.glow-text {
-    background: linear-gradient(45deg, var(--neon-blue), var(--neon-purple));
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    font-weight: 600;
-}
-
-.header-decoration {
-    width: 100px;
-    height: 3px;
-    background: linear-gradient(90deg, var(--neon-blue), var(--neon-purple));
-    margin: 0.5rem auto;
-    border-radius: 2px;
-}
-
-/* Download Section */
-.download-form {
-    display: flex;
-    justify-content: center;
-}
-
-.neon-input-group {
-    display: flex;
-    max-width: 800px;
-    width: 100%;
-    margin: 0 auto;
-}
-
-.neon-input {
-    background: rgba(255, 255, 255, 0.05) !important;
-    border: 1px solid rgba(0, 243, 255, 0.3) !important;
-    color: var(--text-primary) !important;
-    border-radius: 12px 0 0 12px !important;
-    padding: 1rem;
-    transition: all 0.3s ease;
-}
-
-.neon-input:focus {
-    border-color: var(--neon-blue) !important;
-    box-shadow: 0 0 20px rgba(0, 243, 255, 0.3) !important;
-    background: rgba(255, 255, 255, 0.08) !important;
-}
-
-.neon-btn {
-    background: linear-gradient(45deg, var(--neon-blue), var(--neon-purple));
-    border: none;
-    border-radius: 0 12px 12px 0;
-    padding: 1rem 2rem;
-    font-weight: 600;
-    transition: all 0.3s ease;
-    white-space: nowrap;
-}
-
-.neon-btn:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 5px 15px rgba(0, 243, 255, 0.4);
-}
-
-.progress-section {
-    margin: 2rem 0;
-    max-width: 800px;
-    margin: 2rem auto;
-}
-
-.progress-info {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 0.5rem;
-}
-
-.status-text {
-    color: var(--neon-green);
-    font-weight: 500;
-}
-
-.progress-text {
-    color: var(--neon-blue);
-    font-weight: 600;
-}
-
-.neon-progress {
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 10px;
-    height: 20px;
-    overflow: hidden;
-    border: 1px solid rgba(0, 243, 255, 0.3);
-}
-
-.neon-progress .progress-bar {
-    background: linear-gradient(90deg, var(--neon-green), var(--neon-blue));
-    transition: width 0.3s ease;
-}
-
-.controls {
-    text-align: center;
-}
-
-.neon-btn-danger {
-    background: linear-gradient(45deg, #ff0080, #ff0000);
-    border: none;
-    border-radius: 12px;
-    padding: 1rem 2rem;
-    font-weight: 600;
-    transition: all 0.3s ease;
-}
-
-.neon-btn-danger:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 5px 15px rgba(255, 0, 128, 0.4);
-}
-
-/* Stats Section */
-.stats-section .row {
-    gap: 1rem;
-}
-
-.stat-card {
-    background: rgba(255, 255, 255, 0.05);
-    border-radius: 15px;
-    padding: 1.5rem;
-    text-align: center;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    transition: all 0.3s ease;
-}
-
-.stat-card:hover {
-    transform: translateY(-5px);
-    border-color: var(--neon-blue);
-    box-shadow: 0 10px 25px rgba(0, 243, 255, 0.2);
-}
-
-.stat-icon {
-    font-size: 2.5rem;
-    background: linear-gradient(45deg, var(--neon-blue), var(--neon-purple));
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    margin-bottom: 1rem;
-}
-
-.stat-info h5 {
-    font-size: 1.8rem;
-    font-weight: 700;
-    color: var(--neon-green);
-    margin-bottom: 0.5rem;
-}
-
-.stat-info span {
-    color: var(--text-secondary);
-    font-size: 0.9rem;
-}
-
-/* Player Section */
-.video-player-container {
-    max-width: 1200px;
-    margin: 0 auto;
-}
-
-.custom-player {
-    position: relative;
-    background: #000;
-    border-radius: 15px;
-    overflow: hidden;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-}
-
-.video-element {
-    width: 100%;
-    height: auto;
-    display: block;
-}
-
-.custom-controls {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    background: linear-gradient(transparent, rgba(0, 0, 0, 0.8));
-    padding: 1rem;
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    opacity: 0;
-    transition: opacity 0.3s ease;
-}
-
-.custom-player:hover .custom-controls {
-    opacity: 1;
-}
-
-.control-btn {
-    background: rgba(255, 255, 255, 0.2);
-    border: none;
-    color: white;
-    width: 40px;
-    height: 40px;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    transition: all 0.3s ease;
-}
-
-.control-btn:hover {
-    background: var(--neon-blue);
-    transform: scale(1.1);
-}
-
-.progress-container {
-    flex: 1;
-}
-
-.progress-bar-container {
-    background: rgba(255, 255, 255, 0.3);
-    height: 6px;
-    border-radius: 3px;
-    cursor: pointer;
-    position: relative;
-}
-
-.progress-bar-video {
-    background: linear-gradient(90deg, var(--neon-blue), var(--neon-purple));
-    height: 100%;
-    border-radius: 3px;
-    width: 0%;
-    transition: width 0.1s ease;
-}
-
-.time-display {
-    color: white;
-    font-size: 0.9rem;
-    min-width: 80px;
-}
-
-.volume-slider {
-    width: 80px;
-    cursor: pointer;
-}
-
-.player-actions {
-    text-align: center;
-    margin-top: 1.5rem;
-}
-
-.neon-btn-outline {
-    border: 2px solid var(--neon-blue);
-    color: var(--neon-blue);
-    background: transparent;
-    border-radius: 12px;
-    padding: 0.8rem 1.5rem;
-    transition: all 0.3s ease;
-}
-
-.neon-btn-outline:hover {
-    background: var(--neon-blue);
-    color: var(--dark-bg);
-}
-
-/* Video List Section */
-.sidebar-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 1.5rem;
-    padding-bottom: 1rem;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-}
-
-.refresh-btn {
-    border: 1px solid var(--neon-blue);
-    color: var(--neon-blue);
-    transition: all 0.3s ease;
-}
-
-.refresh-btn:hover {
-    background: var(--neon-blue);
-    color: var(--dark-bg);
-    transform: rotate(180deg);
-}
-
-.video-strip-container {
-    overflow-x: auto;
-    padding-bottom: 1rem;
-}
-
-.video-strip {
-    display: flex;
-    gap: 1rem;
-    min-width: max-content;
-}
-
-.video-item {
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 12px;
-    padding: 1rem;
-    transition: all 0.3s ease;
-    cursor: pointer;
-    min-width: 300px;
-}
-
-.video-item:hover {
-    background: rgba(0, 243, 255, 0.1);
-    border-color: var(--neon-blue);
-    transform: translateY(-5px);
-    box-shadow: 0 5px 15px rgba(0, 243, 255, 0.2);
-}
-
-.video-title {
-    font-size: 0.9rem;
-    color: var(--text-primary);
-    margin-bottom: 0.5rem;
-    line-height: 1.4;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.video-actions {
-    display: flex;
-    gap: 0.5rem;
-    justify-content: center;
-}
-
-/* Footer */
-.footer {
-    background: rgba(10, 10, 15, 0.95);
-    backdrop-filter: blur(20px);
-    border-top: 1px solid rgba(0, 243, 255, 0.3);
-    padding: 1.5rem 0;
-    text-align: center;
-    color: var(--text-secondary);
-}
-
-/* Scrollbar */
-::-webkit-scrollbar {
-    height: 8px;
-    width: 8px;
-}
-
-::-webkit-scrollbar-track {
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb {
-    background: linear-gradient(var(--neon-blue), var(--neon-purple));
-    border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-    background: linear-gradient(var(--neon-purple), var(--neon-blue));
-}
-
-/* Responsive */
-@media (max-width: 768px) {
-    .download-section, .stats-section, .player-section, .video-list-section {
-        margin: 1rem;
-        padding: 1.5rem;
-    }
-
-    .neon-input-group {
-        flex-direction: column;
-    }
-
-    .neon-input {
-        border-radius: 12px !important;
-        margin-bottom: 1rem;
-    }
-
-    .neon-btn {
-        border-radius: 12px;
-    }
-
-    .stat-card {
-        margin-bottom: 1rem;
-    }
-
-    .video-item {
-        min-width: 250px;
-    }
-}
-"""
-
-SCRIPT_JS = """
-const socket = io();
-let currentSid = null;
-let isPlaying = false;
-let currentVideoElement = null;
-
-// تنظیم base URL برای VPS
-function getBaseUrl() {
-    return window.location.origin;
-}
-
-// Initialize when page loads
-document.addEventListener('DOMContentLoaded', function() {
-    updateVideoList();
-    initCustomPlayer();
-});
-
-// Initialize custom video player
-function initCustomPlayer() {
-    currentVideoElement = document.getElementById('player');
-    const playPauseBtn = document.getElementById('play-pause');
-    const progressBarVideo = document.getElementById('progress-bar-video');
-    const volumeBtn = document.getElementById('volume-btn');
-    const volumeSlider = document.getElementById('volume-slider');
-    const fullscreenBtn = document.getElementById('fullscreen-btn');
-    const currentTimeEl = document.getElementById('current-time');
-    const durationEl = document.getElementById('duration');
-
-    // Play/Pause
-    playPauseBtn.addEventListener('click', togglePlayPause);
-
-    // Progress bar
-    currentVideoElement.addEventListener('timeupdate', updateProgressBar);
-
-    // Volume control
-    volumeBtn.addEventListener('click', toggleMute);
-    volumeSlider.addEventListener('input', setVolume);
-
-    // Fullscreen
-    fullscreenBtn.addEventListener('click', toggleFullscreen);
-
-    // Video events
-    currentVideoElement.addEventListener('loadedmetadata', function() {
-        durationEl.textContent = formatTime(currentVideoElement.duration);
-    });
-
-    // Click on progress bar
-    document.querySelector('.progress-bar-container').addEventListener('click', function(e) {
-        const rect = this.getBoundingClientRect();
-        const percent = (e.clientX - rect.left) / rect.width;
-        currentVideoElement.currentTime = percent * currentVideoElement.duration;
-    });
-}
-
-function togglePlayPause() {
-    const icon = document.querySelector('#play-pause i');
-    if (currentVideoElement.paused) {
-        currentVideoElement.play();
-        icon.className = 'fas fa-pause';
-        isPlaying = true;
-    } else {
-        currentVideoElement.pause();
-        icon.className = 'fas fa-play';
-        isPlaying = false;
-    }
-}
-
-function updateProgressBar() {
-    const progress = (currentVideoElement.currentTime / currentVideoElement.duration) * 100;
-    document.getElementById('progress-bar-video').style.width = progress + '%';
-    document.getElementById('current-time').textContent = formatTime(currentVideoElement.currentTime);
-}
-
-function toggleMute() {
-    const icon = document.querySelector('#volume-btn i');
-    currentVideoElement.muted = !currentVideoElement.muted;
-    icon.className = currentVideoElement.muted ? 'fas fa-volume-mute' : 'fas fa-volume-up';
-}
-
-function setVolume() {
-    currentVideoElement.volume = volumeSlider.value / 100;
-    const icon = document.querySelector('#volume-btn i');
-    if (currentVideoElement.volume === 0) {
-        icon.className = 'fas fa-volume-mute';
-    } else if (currentVideoElement.volume < 0.5) {
-        icon.className = 'fas fa-volume-down';
-    } else {
-        icon.className = 'fas fa-volume-up';
-    }
-}
-
-function toggleFullscreen() {
-    const player = document.querySelector('.custom-player');
-    if (!document.fullscreenElement) {
-        player.requestFullscreen().catch(err => {
-            console.log(`Error attempting to enable fullscreen: ${err.message}`);
-        });
-    } else {
-        document.exitFullscreen();
-    }
-}
-
-function formatTime(seconds) {
-    const minutes = Math.floor(seconds / 60);
-    seconds = Math.floor(seconds % 60);
-    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-}
-
-// Download form handler
-document.getElementById('download-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const url = document.getElementById('url').value.trim();
-
-    if (!url) {
-        showNotification('لطفا لینک ویدیو را وارد کنید', 'warning');
-        return;
-    }
-
-    console.log('Starting download for URL:', url);
-    updateStatus('در حال شروع دانلود...', 'info');
-    document.getElementById('active-downloads').textContent = '1';
-
-    try {
-        const response = await fetch('/download', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-            },
-            body: `url=${encodeURIComponent(url)}`
-        });
-
-        const data = await response.json();
-        if (data.error) {
-            showNotification('خطا: ' + data.error, 'error');
-            updateStatus('خطا در دانلود', 'danger');
-            console.error('Download error:', data.error);
-            return;
+VENDOR_DIR = os.path.join(JS_DIR, 'vendor')
+
+for d in [VIDEO_DIR, CSS_DIR, JS_DIR, FONTS_DIR, VENDOR_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+# ====================== وضعیت دانلود تکی ======================
+single_downloads = {}  # {sid: {'stop': bool, 'thread': Thread}}
+
+# ====================== مدیریت صف دانلود ======================
+class QueueManager:
+    def __init__(self):
+        self.queues = {}  # queue_id -> QueueState
+
+    def create_queue(self, urls):
+        queue_id = str(uuid.uuid4())
+        state = {
+            'id': queue_id,
+            'urls': urls,
+            'current_index': 0,
+            'items': [{'url': url, 'status': 'waiting', 'title': '', 'error': None} for url in urls],
+            'stop_flag': False,
+            'thread': None,
+            'total_percent': 0
         }
+        self.queues[queue_id] = state
+        return queue_id
 
-        currentSid = data.sid;
-        document.getElementById('stop-btn').disabled = false;
-        updateStatus('در حال دانلود...', 'warning');
+    def start_queue(self, queue_id):
+        state = self.queues.get(queue_id)
+        if not state or state['thread'] and state['thread'].is_alive():
+            return False
+        state['stop_flag'] = False
+        thread = threading.Thread(target=self._process_queue, args=(queue_id,))
+        thread.daemon = True
+        state['thread'] = thread
+        thread.start()
+        return True
 
-    } catch (error) {
-        console.error('Network error:', error);
-        showNotification('خطای شبکه: ' + error.message, 'error');
-        updateStatus('خطای شبکه', 'danger');
-    }
-});
+    def stop_queue(self, queue_id):
+        state = self.queues.get(queue_id)
+        if state:
+            state['stop_flag'] = True
+            return True
+        return False
 
-// Stop download handler
-document.getElementById('stop-btn').addEventListener('click', async () => {
-    if (currentSid) {
-        console.log('Stopping download for SID:', currentSid);
-        updateStatus('در حال توقف دانلود...', 'warning');
+    def _process_queue(self, queue_id):
+        state = self.queues[queue_id]
+        total = len(state['urls'])
+        completed = 0
+        failed = 0
 
-        try {
-            const response = await fetch(`/stop/${currentSid}`, { method: 'POST' });
-            const data = await response.json();
+        for idx, url in enumerate(state['urls']):
+            if state['stop_flag']:
+                state['items'][idx]['status'] = 'stopped'
+                break
+            if idx < state['current_index']:
+                continue
+            state['current_index'] = idx
+            state['items'][idx]['status'] = 'downloading'
 
-            if (data.status) {
-                showNotification(data.status, 'success');
-                updateStatus('دانلود متوقف شد', 'info');
-            } else {
-                showNotification(data.error, 'error');
-                updateStatus('خطا در توقف', 'danger');
-            }
-
-            document.getElementById('stop-btn').disabled = true;
-            currentSid = null;
-            document.getElementById('active-downloads').textContent = '0';
-
-        } catch (error) {
-            console.error('Stop error:', error);
-            showNotification('خطا در توقف: ' + error.message, 'error');
-        }
-    }
-});
-
-// Refresh video list
-document.getElementById('refresh-btn').addEventListener('click', () => {
-    updateVideoList();
-    showNotification('لیست ویدیوها بروزرسانی شد', 'success');
-});
-
-// Close player
-document.getElementById('close-player').addEventListener('click', () => {
-    if (currentVideoElement) {
-        currentVideoElement.pause();
-        currentVideoElement.src = '';
-    }
-    document.querySelector('#play-pause i').className = 'fas fa-play';
-    isPlaying = false;
-});
-
-// Socket events
-socket.on('progress', (data) => {
-    console.log('Progress update:', data);
-
-    if (data.sid === currentSid) {
-        const progressBar = document.getElementById('progress-bar');
-        const progressText = document.getElementById('progress-text');
-
-        progressBar.style.width = `${data.percent}%`;
-        progressText.textContent = `${Math.round(data.percent)}%`;
-        progressBar.setAttribute('aria-valuenow', data.percent);
-
-        updateStatus(data.status, 'info');
-
-        if (data.percent === 100) {
-            document.getElementById('stop-btn').disabled = true;
-            currentSid = null;
-            updateStatus('دانلود کامل شد!', 'success');
-            document.getElementById('active-downloads').textContent = '0';
-            setTimeout(updateVideoList, 2000);
-            showNotification('دانلود با موفقیت کامل شد!', 'success');
-        }
-
-        if (data.filename) {
-            setTimeout(updateVideoList, 1000);
-        }
-    }
-});
-
-socket.on('error', (data) => {
-    if (data.sid === currentSid) {
-        updateStatus('خطا: ' + data.message, 'danger');
-        document.getElementById('stop-btn').disabled = true;
-        currentSid = null;
-        document.getElementById('active-downloads').textContent = '0';
-        showNotification('خطا در دانلود: ' + data.message, 'error');
-    }
-});
-
-// Update video list
-async function updateVideoList() {
-    console.log('Updating video list');
-    try {
-        const response = await fetch('/videos');
-        const videos = await response.json();
-        console.log('Videos fetched:', videos);
-
-        const videoStrip = document.getElementById('video-strip');
-        const totalVideos = document.getElementById('total-videos');
-
-        videoStrip.innerHTML = '';
-        totalVideos.textContent = videos.length;
-
-        if (videos.length === 0) {
-            videoStrip.innerHTML = `
-                <div class="video-item text-center">
-                    <div class="text-muted">
-                        <i class="fas fa-video-slash fa-2x mb-2"></i>
-                        <p>ویدیویی یافت نشد</p>
-                    </div>
-                </div>
-            `;
-            return;
-        }
-
-        videos.forEach(video => {
-            const div = document.createElement('div');
-            div.className = 'video-item';
-
-            const videoUrl = `${getBaseUrl()}${video.path}`;
-            const displayName = video.name.length > 30 ? video.name.substring(0, 30) + '...' : video.name;
-
-            div.innerHTML = `
-                <div class="video-title">${displayName}</div>
-                <div class="video-actions">
-                    <button class="btn btn-success btn-sm" onclick="playVideo('${videoUrl}')">
-                        <i class="fas fa-play me-1"></i>
-                        پخش
-                    </button>
-                    <button class="btn btn-info btn-sm" onclick="downloadVideo('${videoUrl}', '${video.name}')">
-                        <i class="fas fa-download me-1"></i>
-                        دانلود
-                    </button>
-                </div>
-            `;
-            videoStrip.appendChild(div);
-        });
-    } catch (error) {
-        console.error('Error updating video list:', error);
-        showNotification('خطا در بارگذاری لیست ویدیوها', 'error');
-    }
-}
-
-// Play video function
-function playVideo(fullUrl) {
-    console.log('Playing video from URL:', fullUrl);
-    const timestamp = new Date().getTime();
-    const videoUrl = `${fullUrl}?t=${timestamp}`;
-
-    // Reset player state
-    if (currentVideoElement) {
-        currentVideoElement.pause();
-        currentVideoElement.src = '';
-    }
-
-    // Set new video source
-    currentVideoElement.src = videoUrl;
-
-    // Setup event listeners for this video
-    currentVideoElement.onloadstart = () => {
-        updateStatus('در حال بارگذاری ویدیو...', 'info');
-    };
-
-    currentVideoElement.onloadeddata = () => {
-        updateStatus('ویدیو بارگذاری شد', 'success');
-        document.querySelector('#play-pause i').className = 'fas fa-play';
-    };
-
-    currentVideoElement.oncanplay = () => {
-        console.log('Video can play');
-        updateStatus('آماده پخش', 'success');
-    };
-
-    currentVideoElement.onerror = (e) => {
-        console.error('Video error details:', {
-            error: currentVideoElement.error,
-            networkState: currentVideoElement.networkState,
-            readyState: currentVideoElement.readyState
-        });
-
-        let errorMessage = 'خطا در بارگذاری ویدیو';
-        if (currentVideoElement.error) {
-            switch(currentVideoElement.error.code) {
-                case currentVideoElement.error.MEDIA_ERR_NETWORK:
-                    errorMessage = 'خطای شبکه - ویدیو قابل دسترسی نیست';
-                    break;
-                case currentVideoElement.error.MEDIA_ERR_DECODE:
-                    errorMessage = 'خطای decode - فرمت ویدیو پشتیبانی نمی‌شود';
-                    break;
-                case currentVideoElement.error.MEDIA_ERR_SRC_NOT_SUPPORTED:
-                    errorMessage = 'فرمت ویدیو پشتیبانی نمی‌شود';
-                    break;
-            }
-        }
-
-        updateStatus(errorMessage, 'danger');
-        showNotification(errorMessage, 'error');
-    };
-
-    // Load video
-    currentVideoElement.load();
-
-    // Scroll to player
-    document.querySelector('.player-section').scrollIntoView({ behavior: 'smooth' });
-}
-
-// Download video function
-function downloadVideo(url, filename) {
-    console.log('Downloading video:', filename);
-    showNotification('در حال دانلود ویدیو...', 'info');
-
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-}
-
-// Update status function
-function updateStatus(message, type = 'info') {
-    const statusElement = document.getElementById('status');
-    statusElement.textContent = message;
-
-    statusElement.className = 'status-text';
-
-    switch(type) {
-        case 'success':
-            statusElement.style.color = 'var(--neon-green)';
-            break;
-        case 'warning':
-            statusElement.style.color = 'var(--neon-pink)';
-            break;
-        case 'danger':
-            statusElement.style.color = '#ff4444';
-            break;
-        default:
-            statusElement.style.color = 'var(--neon-blue)';
-    }
-}
-
-// Notification system
-function showNotification(message, type = 'info') {
-    const existingNotification = document.querySelector('.custom-notification');
-    if (existingNotification) {
-        existingNotification.remove();
-    }
-
-    const notification = document.createElement('div');
-    notification.className = `custom-notification alert alert-${type === 'error' ? 'danger' : type}`;
-    notification.style.cssText = `
-        position: fixed;
-        top: 20px;
-        left: 50%;
-        transform: translateX(-50%);
-        z-index: 9999;
-        min-width: 300px;
-        text-align: center;
-        border-radius: 10px;
-        backdrop-filter: blur(20px);
-        border: 1px solid rgba(255,255,255,0.2);
-    `;
-
-    notification.innerHTML = `
-        <div class="d-flex align-items-center justify-content-center">
-            <i class="fas fa-${getNotificationIcon(type)} me-2"></i>
-            <span>${message}</span>
-        </div>
-    `;
-
-    document.body.appendChild(notification);
-
-    setTimeout(() => {
-        if (notification.parentNode) {
-            notification.parentNode.removeChild(notification);
-        }
-    }, 5000);
-}
-
-function getNotificationIcon(type) {
-    switch(type) {
-        case 'success': return 'check-circle';
-        case 'warning': return 'exclamation-triangle';
-        case 'error': return 'exclamation-circle';
-        default: return 'info-circle';
-    }
-}
-"""
-
-# ذخیره فایل‌های استاتیک
-with open(os.path.join(CSS_DIR, 'style.css'), 'w', encoding='utf-8') as f:
-    f.write(STYLE_CSS)
-with open(os.path.join(JS_DIR, 'script.js'), 'w', encoding='utf-8') as f:
-    f.write(SCRIPT_JS)
-
-# کد پشتی باقی می‌ماند همانند قبل (با کمی بهبود)
-download_status = {}
-
-def progress_hook(d):
-    sid = d.get('sid')
-    if not sid:
-        return
-
-    if d['status'] == 'downloading':
-        total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
-        downloaded = d.get('downloaded_bytes', 0)
-        if total and total > 0:
-            percent = (downloaded / total) * 100
-            socketio.emit('progress', {
-                'sid': sid,
-                'percent': percent,
-                'status': f'در حال دانلود: {percent:.1f}%'
+            # اطلاع‌رسانی وضعیت آیتم
+            socketio.emit('queue_item_update', {
+                'queue_id': queue_id,
+                'index': idx,
+                'status': 'downloading',
+                'title': state['items'][idx]['title']
             })
 
-    elif d['status'] == 'finished':
-        filename = os.path.basename(d['filename'])
-        socketio.emit('progress', {
-            'sid': sid,
-            'percent': 100,
-            'status': 'دانلود کامل شد!',
-            'filename': filename
-        })
+            # دانلود با پشتیبانی از توقف
+            def stop_flag():
+                return state['stop_flag']
 
-    elif d['status'] == 'error':
-        socketio.emit('error', {
-            'sid': sid,
-            'message': d.get('error', 'خطای ناشناخته')
-        })
+            try:
+                filename = download_single(url, stop_flag=stop_flag, sid_prefix=f"queue_{queue_id}_{idx}")
+                if filename:
+                    state['items'][idx]['status'] = 'done'
+                    completed += 1
+                    state['items'][idx]['title'] = filename
+                else:
+                    state['items'][idx]['status'] = 'failed'
+                    failed += 1
+            except Exception as e:
+                state['items'][idx]['status'] = 'failed'
+                state['items'][idx]['error'] = str(e)
+                failed += 1
 
-def download_video(url, sid):
-    if download_status.get(sid, {}).get('stop', False):
-        socketio.emit('progress', {'sid': sid, 'status': 'دانلود متوقف شد'})
-        return
+            # ارسال پیشرفت کلی
+            overall_percent = ((completed + failed) / total) * 100
+            state['total_percent'] = overall_percent
+            socketio.emit('queue_progress', {
+                'queue_id': queue_id,
+                'completed': completed,
+                'failed': failed,
+                'total': total,
+                'percent': overall_percent,
+                'current_item': idx
+            })
+
+        # پایان صف
+        final_status = 'finished' if not state['stop_flag'] else 'stopped'
+        socketio.emit('queue_finished', {
+            'queue_id': queue_id,
+            'status': final_status,
+            'completed': completed,
+            'failed': failed
+        })
+        # پاک کردن صف از حافظه (اختیاری)
+        del self.queues[queue_id]
+
+queue_manager = QueueManager()
+
+# ====================== تابع دانلود مشترک ======================
+def download_single(url, stop_flag=None, sid_prefix=None):
+    """
+    دانلود یک ویدیو با قابلیت توقف.
+    اگر stop_flag برگرداند True، دانلود قطع می‌شود.
+    """
+    def progress_hook(d):
+        if stop_flag and stop_flag():
+            raise Exception("CANCELLED")
+        if d['status'] == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+            downloaded = d.get('downloaded_bytes', 0)
+            if total and total > 0:
+                percent = (downloaded / total) * 100
+                socketio.emit('download_progress', {
+                    'sid': sid_prefix or 'single',
+                    'percent': percent,
+                    'status': f'در حال دانلود: {percent:.1f}%'
+                })
+        elif d['status'] == 'finished':
+            socketio.emit('download_progress', {
+                'sid': sid_prefix or 'single',
+                'percent': 100,
+                'status': 'کامل شد',
+                'filename': os.path.basename(d['filename'])
+            })
 
     ydl_opts = {
         'outtmpl': os.path.join(VIDEO_DIR, '%(title).100s.%(ext)s'),
         'format': 'best[height<=720]/best',
         'noplaylist': True,
-        'progress_hooks': [lambda d: progress_hook({**d, 'sid': sid})],
-        'quiet': False,
-        'no_warnings': False,
-        'http_chunk_size': 10485760,
+        'progress_hooks': [progress_hook],
+        'quiet': True,
+        'no_warnings': True
     }
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            socketio.emit('progress', {
-                'sid': sid,
+            title = info.get('title', 'unknown')
+            socketio.emit('download_progress', {
+                'sid': sid_prefix or 'single',
                 'percent': 0,
-                'status': f'آماده سازی: {info.get("title", "Unknown")}'
+                'status': f'آماده‌سازی: {title}'
             })
             ydl.download([url])
-
+        return True
     except Exception as e:
-        error_msg = str(e)
-        print(f"Download error: {error_msg}")
-        socketio.emit('error', {
-            'sid': sid,
-            'message': error_msg
-        })
+        if 'CANCELLED' in str(e):
+            socketio.emit('download_progress', {
+                'sid': sid_prefix or 'single',
+                'percent': 0,
+                'status': 'متوقف شد'
+            })
+        else:
+            socketio.emit('download_error', {
+                'sid': sid_prefix or 'single',
+                'message': str(e)
+            })
+        return False
 
+# ====================== مسیرهای Flask ======================
 @app.route('/')
 def index():
-    return render_template_string(INDEX_HTML)
+    return render_template_string(HTML_TEMPLATE)
 
-@app.route('/download', methods=['POST'])
-def start_download():
-    url = request.form.get('url', '').strip()
-    if not url:
-        return jsonify({'error': 'لینک نمی‌تواند خالی باشد!'})
-
-    if not url.startswith(('http://', 'https://')):
-        return jsonify({'error': 'لینک نامعتبر است! باید با http:// یا https:// شروع شود.'})
-
-    sid = str(uuid.uuid4())
-    download_status[sid] = {'url': url, 'stop': False}
-
-    thread = threading.Thread(target=download_video, args=(url, sid))
-    thread.daemon = True
-    thread.start()
-
-    return jsonify({'sid': sid, 'status': 'دانلود شروع شد'})
-
-@app.route('/stop/<sid>', methods=['POST'])
-def stop_download(sid):
-    if sid in download_status:
-        download_status[sid]['stop'] = True
-        return jsonify({'status': 'درخواست توقف ثبت شد'})
-    return jsonify({'error': 'دانلود یافت نشد'})
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    return send_from_directory(STATIC_DIR, filename)
 
 @app.route('/videos')
 def list_videos():
-    try:
-        videos = []
-        for f in os.listdir(VIDEO_DIR):
-            file_path = os.path.join(VIDEO_DIR, f)
-            if os.path.isfile(file_path) and f.lower().endswith(('.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv')):
-                encoded_name = urllib.parse.quote(f)
-                videos.append({
-                    'name': f,
-                    'path': f'/videos/{encoded_name}'
-                })
-        videos.sort(key=lambda x: os.path.getctime(os.path.join(VIDEO_DIR, x['name'])), reverse=True)
-        return jsonify(videos)
-    except Exception as e:
-        print(f"Error listing videos: {e}")
-        return jsonify([])
+    videos = []
+    for f in os.listdir(VIDEO_DIR):
+        if f.lower().endswith(('.mp4', '.webm', '.mkv', '.avi', '.mov')):
+            videos.append({
+                'name': f,
+                'path': f'/videos/{urllib.parse.quote(f)}'
+            })
+    videos.sort(key=lambda x: os.path.getctime(os.path.join(VIDEO_DIR, x['name'])), reverse=True)
+    return jsonify(videos)
 
-@app.route('/videos/<filename>')
+@app.route('/videos/<path:filename>')
 def serve_video(filename):
-    try:
-        decoded_filename = urllib.parse.unquote(filename)
-        file_path = os.path.join(VIDEO_DIR, decoded_filename)
+    safe_name = os.path.basename(urllib.parse.unquote(filename))
+    return send_from_directory(VIDEO_DIR, safe_name)
 
-        if not os.path.isfile(file_path):
-            return "ویدیو یافت نشد", 404
+# ---------- دانلود تکی ----------
+@app.route('/download', methods=['POST'])
+def start_download():
+    url = request.form.get('url', '').strip()
+    if not url or not url.startswith(('http://', 'https://')):
+        return jsonify({'error': 'لینک نامعتبر است'})
+    sid = str(uuid.uuid4())
+    stop_flag = threading.Event()
+    single_downloads[sid] = {'stop_flag': stop_flag}
 
-        response = send_from_directory(VIDEO_DIR, decoded_filename)
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Accept-Ranges', 'bytes')
+    def download_task():
+        def is_stopped():
+            return stop_flag.is_set()
+        success = download_single(url, stop_flag=is_stopped, sid_prefix=sid)
+        single_downloads.pop(sid, None)
+        if not success and not stop_flag.is_set():
+            socketio.emit('download_error', {'sid': sid, 'message': 'دانلود ناموفق'})
 
-        return response
+    thread = threading.Thread(target=download_task)
+    thread.daemon = True
+    thread.start()
+    return jsonify({'sid': sid})
 
-    except Exception as e:
-        print(f"Error serving video {filename}: {e}")
-        return "خطا در سرویس دهی ویدیو", 500
+@app.route('/stop/<sid>', methods=['POST'])
+def stop_download(sid):
+    if sid in single_downloads:
+        single_downloads[sid]['stop_flag'].set()
+        return jsonify({'status': 'توقف درخواست شد'})
+    return jsonify({'error': 'یافت نشد'})
 
+# ---------- عملیات صف ----------
+@app.route('/queue/create', methods=['POST'])
+def create_queue():
+    data = request.get_json()
+    urls = data.get('urls', [])
+    urls = [u.strip() for u in urls if u.strip().startswith(('http://', 'https://'))]
+    if not urls:
+        return jsonify({'error': 'هیچ لینک معتبری وارد نشده'})
+    queue_id = queue_manager.create_queue(urls)
+    queue_manager.start_queue(queue_id)
+    return jsonify({'queue_id': queue_id})
+
+@app.route('/queue/stop/<queue_id>', methods=['POST'])
+def stop_queue(queue_id):
+    if queue_manager.stop_queue(queue_id):
+        return jsonify({'status': 'توقف صف درخواست شد'})
+    return jsonify({'error': 'صف یافت نشد'})
+
+# ====================== HTML, CSS, JS یکپارچه ======================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>وی‌پلیر حرفه‌ای | دانلود و پخش ویدیو</title>
+    <style>
+        /* ========== CSS یکپارچه (بدون CDN) ========== */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        @font-face {
+            font-family: 'Vazirmatn';
+            src: url('/static/fonts/Vazirmatn-Regular.woff2') format('woff2');
+            font-weight: normal;
+            font-style: normal;
+        }
+
+        @font-face {
+            font-family: 'Vazirmatn';
+            src: url('/static/fonts/Vazirmatn-Bold.woff2') format('woff2');
+            font-weight: bold;
+        }
+
+        body {
+            font-family: 'Vazirmatn', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            line-height: 1.6;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Header */
+        .header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        .header h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(135deg, #38bdf8, #818cf8);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+        }
+        .header p {
+            color: #94a3b8;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 1rem;
+            border-bottom: 1px solid #334155;
+            margin-bottom: 2rem;
+        }
+        .tab-btn {
+            background: none;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            font-family: inherit;
+            color: #94a3b8;
+            cursor: pointer;
+            transition: all 0.2s;
+            border-radius: 8px 8px 0 0;
+        }
+        .tab-btn.active {
+            color: #38bdf8;
+            border-bottom: 2px solid #38bdf8;
+            background: rgba(56, 189, 248, 0.1);
+        }
+        .tab-pane {
+            display: none;
+            animation: fadeIn 0.3s ease;
+        }
+        .tab-pane.active {
+            display: block;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px);}
+            to { opacity: 1; transform: translateY(0);}
+        }
+
+        /* Cards */
+        .card {
+            background: #1e293b;
+            border-radius: 20px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+        }
+        .card-title {
+            font-size: 1.25rem;
+            margin-bottom: 1rem;
+            color: #f1f5f9;
+        }
+
+        /* Form */
+        .input-group {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+        .input-group input, .input-group textarea {
+            flex: 1;
+            padding: 0.75rem;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            color: #f1f5f9;
+            font-family: inherit;
+        }
+        .input-group textarea {
+            min-height: 150px;
+            resize: vertical;
+        }
+        button {
+            background: #3b82f6;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 12px;
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        button:hover {
+            background: #2563eb;
+            transform: translateY(-2px);
+        }
+        button.danger {
+            background: #dc2626;
+        }
+        button.danger:hover {
+            background: #b91c1c;
+        }
+
+        /* Progress */
+        .progress-wrapper {
+            margin-top: 1rem;
+        }
+        .progress-bar-bg {
+            background: #334155;
+            border-radius: 10px;
+            height: 8px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            background: linear-gradient(90deg, #3b82f6, #a855f7);
+            width: 0%;
+            height: 100%;
+            transition: width 0.2s;
+        }
+        .status-text {
+            font-size: 0.875rem;
+            margin-top: 0.5rem;
+            color: #94a3b8;
+        }
+
+        /* Queue items */
+        .queue-items {
+            max-height: 400px;
+            overflow-y: auto;
+            margin-top: 1rem;
+        }
+        .queue-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.5rem;
+            border-bottom: 1px solid #334155;
+        }
+        .queue-status {
+            font-size: 0.75rem;
+            padding: 0.25rem 0.5rem;
+            border-radius: 20px;
+        }
+        .status-waiting { background: #475569; }
+        .status-downloading { background: #3b82f6; }
+        .status-done { background: #10b981; }
+        .status-failed { background: #ef4444; }
+        .status-stopped { background: #f59e0b; }
+
+        /* Video grid */
+        .video-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+        .video-card {
+            background: #1e293b;
+            border-radius: 16px;
+            padding: 1rem;
+            transition: 0.2s;
+        }
+        .video-card h4 {
+            font-size: 1rem;
+            margin-bottom: 0.5rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .video-actions {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+        .video-actions button {
+            padding: 0.4rem 0.8rem;
+            font-size: 0.8rem;
+        }
+
+        /* Player */
+        .player-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 360px;
+            background: #0f172a;
+            border-radius: 20px;
+            box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5);
+            z-index: 1000;
+            display: none;
+        }
+        .player-container.active {
+            display: block;
+        }
+        .player-header {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.5rem 1rem;
+            background: #1e293b;
+            border-radius: 20px 20px 0 0;
+        }
+        .player-video {
+            width: 100%;
+            border-radius: 0 0 20px 20px;
+        }
+        .close-player {
+            cursor: pointer;
+        }
+
+        @media (max-width: 640px) {
+            .player-container {
+                width: 95%;
+                right: 2.5%;
+                left: 2.5%;
+            }
+        }
+    </style>
+    <script src="/static/js/vendor/socket.io.min.js"></script>
+    <script>
+        // ========== تمام کدهای فرانت (بومی، بدون CDN) ==========
+        // این بخش شامل توابع زیر است: مدیریت تب‌ها، دانلود تکی، دانلود صفی، پخش ویدیو، لیست ویدیوها
+        // برای حفظ خوانایی، کد فرانت در فایل نهایی به صورت فشرده اما کامل ارائه می‌شود.
+        // در ادامه کد کامل و قابل اجرا را قرار می‌دهیم.
+    </script>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🎬 وی‌پلیر حرفه‌ای</h1>
+        <p>دانلود و پخش ویدیو از یوتیوب و سایر سایت‌ها — بدون نیاز به اینترنت برای ظاهر</p>
+    </div>
+
+    <div class="tabs">
+        <button class="tab-btn active" data-tab="single">دانلود تکی</button>
+        <button class="tab-btn" data-tab="queue">دانلود صفی</button>
+        <button class="tab-btn" data-tab="videos">ویدیوهای من</button>
+    </div>
+
+    <!-- دانلود تکی -->
+    <div id="single-tab" class="tab-pane active">
+        <div class="card">
+            <div class="card-title">لینک ویدیو را وارد کنید</div>
+            <div class="input-group">
+                <input type="text" id="single-url" placeholder="https://www.youtube.com/watch?v=...">
+                <button id="single-download-btn">دانلود</button>
+            </div>
+            <div class="progress-wrapper" id="single-progress" style="display:none;">
+                <div class="progress-bar-bg"><div class="progress-fill" id="single-progress-fill"></div></div>
+                <div class="status-text" id="single-status"></div>
+            </div>
+            <button id="single-stop-btn" class="danger" style="display:none; margin-top:1rem;">توقف</button>
+        </div>
+    </div>
+
+    <!-- دانلود صفی -->
+    <div id="queue-tab" class="tab-pane">
+        <div class="card">
+            <div class="card-title">لیست لینک‌ها (هر لینک در یک خط)</div>
+            <textarea id="queue-urls" rows="6" placeholder="https://...&#10;https://..."></textarea>
+            <div style="margin-top:1rem; display:flex; gap:1rem;">
+                <button id="queue-start-btn">شروع صف</button>
+                <button id="queue-stop-btn" class="danger">توقف صف</button>
+            </div>
+            <div class="progress-wrapper">
+                <div class="progress-bar-bg"><div class="progress-fill" id="queue-progress-fill"></div></div>
+                <div class="status-text" id="queue-status"></div>
+            </div>
+            <div id="queue-items-container" class="queue-items"></div>
+        </div>
+    </div>
+
+    <!-- ویدیوهای ذخیره شده -->
+    <div id="videos-tab" class="tab-pane">
+        <div class="card">
+            <div class="card-title">کتابخانه ویدیوها</div>
+            <div id="videos-grid" class="video-grid"></div>
+            <button id="refresh-videos" style="margin-top:1rem;">🔄 بروزرسانی</button>
+        </div>
+    </div>
+</div>
+
+<!-- پخش‌کننده شناور -->
+<div id="floating-player" class="player-container">
+    <div class="player-header">
+        <span>در حال پخش</span>
+        <span class="close-player" id="close-player">✖</span>
+    </div>
+    <video id="player-video" class="player-video" controls></video>
+</div>
+
+<script>
+    // ==================== کد کامل JavaScript (بدون وابستگی خارجی) ====================
+    const socket = io();
+    let currentSingleSid = null;
+    let currentQueueId = null;
+
+    // ---- تابع کمکی برای نمایش نوتیفیکیشن ساده ----
+    function showMessage(msg, isError = false) {
+        const div = document.createElement('div');
+        div.textContent = msg;
+        div.style.position = 'fixed';
+        div.style.bottom = '20px';
+        div.style.left = '20px';
+        div.style.backgroundColor = isError ? '#dc2626' : '#10b981';
+        div.style.color = 'white';
+        div.style.padding = '8px 16px';
+        div.style.borderRadius = '20px';
+        div.style.zIndex = '9999';
+        document.body.appendChild(div);
+        setTimeout(() => div.remove(), 3000);
+    }
+
+    // ---- مدیریت تب‌ها ----
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            document.querySelectorAll('.tab-pane').forEach(pane => pane.classList.remove('active'));
+            document.getElementById(`${btn.dataset.tab}-tab`).classList.add('active');
+            if (btn.dataset.tab === 'videos') loadVideos();
+        });
+    });
+
+    // ---- دانلود تکی ----
+    const singleUrl = document.getElementById('single-url');
+    const singleDownloadBtn = document.getElementById('single-download-btn');
+    const singleStopBtn = document.getElementById('single-stop-btn');
+    const singleProgressDiv = document.getElementById('single-progress');
+    const singleProgressFill = document.getElementById('single-progress-fill');
+    const singleStatus = document.getElementById('single-status');
+
+    singleDownloadBtn.addEventListener('click', async () => {
+        const url = singleUrl.value.trim();
+        if (!url) return showMessage('لطفاً لینک را وارد کنید', true);
+        singleDownloadBtn.disabled = true;
+        singleProgressDiv.style.display = 'block';
+        singleStopBtn.style.display = 'inline-block';
+        singleProgressFill.style.width = '0%';
+        singleStatus.textContent = 'در حال شروع...';
+
+        const res = await fetch('/download', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: `url=${encodeURIComponent(url)}`
+        });
+        const data = await res.json();
+        if (data.error) {
+            showMessage(data.error, true);
+            resetSingleUI();
+        } else {
+            currentSingleSid = data.sid;
+        }
+    });
+
+    singleStopBtn.addEventListener('click', async () => {
+        if (currentSingleSid) {
+            await fetch(`/stop/${currentSingleSid}`, {method: 'POST'});
+            showMessage('توقف درخواست شد');
+            resetSingleUI();
+        }
+    });
+
+    function resetSingleUI() {
+        singleDownloadBtn.disabled = false;
+        singleProgressDiv.style.display = 'none';
+        singleStopBtn.style.display = 'none';
+        currentSingleSid = null;
+    }
+
+    // ---- دانلود صفی ----
+    const queueUrlsText = document.getElementById('queue-urls');
+    const queueStartBtn = document.getElementById('queue-start-btn');
+    const queueStopBtn = document.getElementById('queue-stop-btn');
+    const queueProgressFill = document.getElementById('queue-progress-fill');
+    const queueStatusSpan = document.getElementById('queue-status');
+    const queueItemsContainer = document.getElementById('queue-items-container');
+
+    queueStartBtn.addEventListener('click', async () => {
+        const raw = queueUrlsText.value;
+        const urls = raw.split('\\n').map(l => l.trim()).filter(l => l.startsWith('http'));
+        if (urls.length === 0) return showMessage('حداقل یک لینک معتبر وارد کنید', true);
+        const res = await fetch('/queue/create', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({urls})
+        });
+        const data = await res.json();
+        if (data.error) showMessage(data.error, true);
+        else {
+            currentQueueId = data.queue_id;
+            showMessage(`صف با ${urls.length} آیتم شروع شد`);
+            queueStartBtn.disabled = true;
+            queueStopBtn.disabled = false;
+        }
+    });
+
+    queueStopBtn.addEventListener('click', async () => {
+        if (currentQueueId) {
+            await fetch(`/queue/stop/${currentQueueId}`, {method: 'POST'});
+            showMessage('توقف صف درخواست شد');
+            queueStartBtn.disabled = false;
+            queueStopBtn.disabled = true;
+        }
+    });
+
+    // ---- رویدادهای Socket.IO ----
+    socket.on('download_progress', (data) => {
+        if (data.sid === currentSingleSid) {
+            singleProgressFill.style.width = `${data.percent}%`;
+            singleStatus.textContent = data.status;
+            if (data.percent === 100) {
+                resetSingleUI();
+                loadVideos();
+                showMessage('دانلود کامل شد!');
+            }
+        }
+    });
+
+    socket.on('download_error', (data) => {
+        if (data.sid === currentSingleSid) {
+            showMessage('خطا: ' + data.message, true);
+            resetSingleUI();
+        }
+    });
+
+    socket.on('queue_item_update', (data) => {
+        if (data.queue_id !== currentQueueId) return;
+        updateQueueUI();
+    });
+
+    socket.on('queue_progress', (data) => {
+        if (data.queue_id !== currentQueueId) return;
+        queueProgressFill.style.width = `${data.percent}%`;
+        queueStatusSpan.textContent = `${data.completed} از ${data.total} تکمیل شد (${data.failed} خطا)`;
+        updateQueueUI();
+    });
+
+    socket.on('queue_finished', (data) => {
+        if (data.queue_id !== currentQueueId) return;
+        showMessage(`صف به پایان رسید. موفق: ${data.completed}, ناموفق: ${data.failed}`);
+        queueStartBtn.disabled = false;
+        queueStopBtn.disabled = true;
+        currentQueueId = null;
+        loadVideos();
+    });
+
+    function updateQueueUI() {
+        if (!currentQueueId) return;
+        fetch(`/queue/status/${currentQueueId}`)
+            .then(res => res.json())
+            .then(data => {
+                if (data.items) {
+                    queueItemsContainer.innerHTML = data.items.map((item, idx) => `
+                        <div class="queue-item">
+                            <span>${item.title || item.url.substring(0, 40)}</span>
+                            <span class="queue-status status-${item.status}">${item.status}</span>
+                        </div>
+                    `).join('');
+                }
+            })
+            .catch(console.error);
+    }
+
+    // ---- ویدیوهای ذخیره شده ----
+    async function loadVideos() {
+        const res = await fetch('/videos');
+        const videos = await res.json();
+        const grid = document.getElementById('videos-grid');
+        if (videos.length === 0) {
+            grid.innerHTML = '<div>هیچ ویدیویی دانلود نشده است.</div>';
+            return;
+        }
+        grid.innerHTML = videos.map(v => `
+            <div class="video-card">
+                <h4>${v.name.replace(/\.[^/.]+$/, '')}</h4>
+                <div class="video-actions">
+                    <button onclick="playVideo('${v.path}')">▶ پخش</button>
+                    <button onclick="downloadFile('${v.path}', '${v.name}')">⬇ دانلود</button>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    window.playVideo = (path) => {
+        const playerDiv = document.getElementById('floating-player');
+        const videoEl = document.getElementById('player-video');
+        videoEl.src = path;
+        playerDiv.classList.add('active');
+        videoEl.play();
+    };
+    window.downloadFile = (path, name) => {
+        const a = document.createElement('a');
+        a.href = path;
+        a.download = name;
+        a.click();
+    };
+    document.getElementById('close-player').addEventListener('click', () => {
+        document.getElementById('floating-player').classList.remove('active');
+        document.getElementById('player-video').pause();
+    });
+    document.getElementById('refresh-videos').addEventListener('click', loadVideos);
+
+    // بارگذاری اولیه ویدیوها
+    loadVideos();
+
+    // اضافه کردن endpoint موقتی برای گرفتن وضعیت صف (برای UI)
+    // در مسیرهای Flask باید اضافه شود
+</script>
+</body>
+</html>
+"""
+
+# اضافه کردن مسیر وضعیت صف (که در JS استفاده شده)
+@app.route('/queue/status/<queue_id>')
+def queue_status(queue_id):
+    state = queue_manager.queues.get(queue_id)
+    if not state:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify({
+        'items': [{'url': item['url'], 'status': item['status'], 'title': item.get('title', '')} for item in state['items']],
+        'current_index': state['current_index'],
+        'total_percent': state['total_percent']
+    })
+
+# ====================== اجرا ======================
 if __name__ == '__main__':
-    print("🎬 وی‌پلیر در حال اجرا است...")
-    print("🌐 آدرس دسترسی: http://0.0.0.0:5000")
-    print("✨ طراحی مدرن با افکت‌های نئونی")
-    print("⏹️ برای توقف برنامه Ctrl+C را بفشارید")
-
-    socketio.run(
-        app,
-        host='0.0.0.0',
-        port=5000,
-        debug=False,
-        allow_unsafe_werkzeug=True
-    )
-
-
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
