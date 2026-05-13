@@ -1,0 +1,6 @@
+flask
+flask-socketio
+yt-dlp
+paramiko
+psutil
+python-dotenv
