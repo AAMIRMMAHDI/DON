@@ -1,52 +1,57 @@
-name: 🎬 وی‌پلیر (دانلودر تحت وب با تونل خودکار)
+name: 🌐 دانلودر تحت وب (تونل خودکار)
 
 on:
   workflow_dispatch:
 
 jobs:
-  run:
+  run-web-app:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: 📥 دریافت کد مخزن
-        uses: actions/checkout@v4
-
-      - name: 🐍 نصب پایتون و پیش‌نیازها
+      - name: نصب پیش‌نیازها
         run: |
           sudo apt-get update
           sudo apt-get install -y python3 python3-pip wget
-          pip3 install -r requirements.txt
+          pip3 install flask flask-socketio yt-dlp
 
-      - name: 📁 ایجاد پوشه‌های استاتیک و دانلود منابع محلی (socket.io + فونت)
-        run: |
-          mkdir -p static/js/vendor static/fonts
-          # دانلود socket.io client (minified)
-          wget -q -O static/js/vendor/socket.io.min.js https://cdn.socket.io/4.5.0/socket.io.min.js
-          # دانلود فونت وزیرمتن (فقط فایل‌های لازم)
-          wget -q -O static/fonts/Vazirmatn-Regular.woff2 https://github.com/rastikerdar/vazirmatn/releases/download/v33.003/Vazirmatn-Regular.woff2
-          wget -q -O static/fonts/Vazirmatn-Bold.woff2 https://github.com/rastikerdar/vazirmatn/releases/download/v33.003/Vazirmatn-Bold.woff2
-
-      - name: 🔧 دریافت cloudflared
+      - name: دریافت cloudflared
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared-linux-amd64
           sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
 
-      - name: 🚀 اجرای سرور Flask و تونل Cloudflare
+      - name: دریافت فایل‌های برنامه
+        uses: actions/checkout@v4   # فایل app.py و پوشه static را از مخزن می‌خواند
+
+      - name: اجرای سرور و تونل
         run: |
+          echo "🚀 اجرای برنامه Flask..."
           python3 app.py &
-          sleep 8
+          sleep 5
+          
+          echo "🔗 برقراری تونل Cloudflare..."
+          # cloudflared tunnel --url http://localhost:5000 را در بک‌گراند اجرا می‌کنیم
+          # خروجی آن را به فایل می‌فرستیم تا لینک را استخراج کنیم
           nohup cloudflared tunnel --url http://localhost:5000 > tunnel.log 2>&1 &
-          sleep 8
-          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1)
+          sleep 5
+          
+          # لینک trycloudflare.com را از لاگ پیدا کن
+          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' tunnel.log | head -1)
+          
           if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ خطا در دریافت لینک تونل"
+            echo "❌ نتوانست لینک تونل را پیدا کند. محتوای لاگ:"
             cat tunnel.log
             exit 1
           fi
-          echo "=========================================="
-          echo "✅ لینک دسترسی شما: $TUNNEL_URL"
-          echo "=========================================="
-          echo "برای نگهداری سرویس، این جاب را متوقف نکنید."
+          
+          echo "=============================================="
+          echo "🌐 آدرس سایت شما:"
+          echo "👉 $TUNNEL_URL"
+          echo "=============================================="
+          echo "تا زمانی که این تب Actions باز است، سایت آنلاین می‌ماند."
+          echo "برای قطع سرویس، workflow را Cancel کنید."
+          echo ""
+          
+          # نگه داشتن workflow تا زمانی که دستی کنسل شود
           while true; do sleep 60; done
