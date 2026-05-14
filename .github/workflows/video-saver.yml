@@ -1,52 +1,57 @@
-name: 📥 دانلود ویدیو و آپلود به سرور
+name: 🌐 دانلودر تحت وب (تونل خودکار)
 
 on:
   workflow_dispatch:
-    inputs:
-      video_url:
-        description: '🔗 لینک ویدیو (مثلاً یوتیوب)'
-        required: true
-        type: string
 
 jobs:
-  download-and-upload:
+  run-web-app:
     runs-on: ubuntu-latest
-    steps:
-      - name: بررسی لینک
-        run: |
-          if [ -z "${{ github.event.inputs.video_url }}" ]; then
-            echo "❌ لینک ویدیو وارد نشده است!"
-            exit 1
-          fi
-          echo "✅ لینک دریافت شد: ${{ github.event.inputs.video_url }}"
+    timeout-minutes: 360
 
-      - name: نصب yt-dlp و ffmpeg
+    steps:
+      - name: نصب پیش‌نیازها
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip ffmpeg
-          pip3 install yt-dlp
+          sudo apt-get install -y python3 python3-pip wget
+          pip3 install flask flask-socketio yt-dlp
 
-      - name: دانلود ویدیو (تبدیل به mp4)
+      - name: دریافت cloudflared
         run: |
-          yt-dlp \
-            --format "best[height<=720]/best" \
-            --merge-output-format mp4 \
-            --no-playlist \
-            --output "video.mp4" \
-            "${{ github.event.inputs.video_url }}"
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared-linux-amd64
+          sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
 
-      - name: نصب sshpass برای ارسال با پسورد
-        run: sudo apt-get install -y sshpass
+      - name: دریافت فایل‌های برنامه
+        uses: actions/checkout@v4   # فایل app.py و پوشه static را از مخزن می‌خواند
 
-      - name: آپلود فایل به سرور خارجی
+      - name: اجرای سرور و تونل
         run: |
-          sshpass -p 'Amir.1388' scp \
-            -o StrictHostKeyChecking=no \
-            video.mp4 root@185.208.175.180:/root/
-          echo "✅ فایل با موفقیت به سرور ارسال شد"
-
-      - name: (اختیاری) آپلود به عنوان Artifact در GitHub
-        uses: actions/upload-artifact@v4
-        with:
-          name: video-file
-          path: video.mp4
+          echo "🚀 اجرای برنامه Flask..."
+          python3 app.py &
+          sleep 5
+          
+          echo "🔗 برقراری تونل Cloudflare..."
+          # cloudflared tunnel --url http://localhost:5000 را در بک‌گراند اجرا می‌کنیم
+          # خروجی آن را به فایل می‌فرستیم تا لینک را استخراج کنیم
+          nohup cloudflared tunnel --url http://localhost:5000 > tunnel.log 2>&1 &
+          sleep 5
+          
+          # لینک trycloudflare.com را از لاگ پیدا کن
+          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' tunnel.log | head -1)
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ نتوانست لینک تونل را پیدا کند. محتوای لاگ:"
+            cat tunnel.log
+            exit 1
+          fi
+          
+          echo "=============================================="
+          echo "🌐 آدرس سایت شما:"
+          echo "👉 $TUNNEL_URL"
+          echo "=============================================="
+          echo "تا زمانی که این تب Actions باز است، سایت آنلاین می‌ماند."
+          echo "برای قطع سرویس، workflow را Cancel کنید."
+          echo ""
+          
+          # نگه داشتن workflow تا زمانی که دستی کنسل شود
+          while true; do sleep 60; done
