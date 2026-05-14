@@ -1,130 +1,89 @@
-name: Install Xray Panel (3x-ui) on Server
+name: Deploy Xray Panel with Cloudflare Tunnel
 
 on:
-  workflow_dispatch:
-    inputs:
-      server_ip:
-        description: 'Server IP address'
-        required: true
-      ssh_username:
-        description: 'SSH username (usually root)'
-        required: true
-        default: 'root'
-      ssh_password:
-        description: 'SSH password'
-        required: true
-      panel_port:
-        description: 'Panel port (default: 2053)'
-        required: false
-        default: '2053'
-      # در صورت نیاز به Cloudflare - ورودی اختیاری
-      cf_email:
-        description: 'Cloudflare account email (optional)'
-        required: false
-      cf_api_key:
-        description: 'Cloudflare API key (optional)'
-        required: false
-      cf_domain:
-        description: 'Your domain on Cloudflare (e.g., example.com) - optional'
-        required: false
+  workflow_dispatch:   # اجرای دستی از طریق دکمه‌ی "Run workflow"
 
 jobs:
-  install-panel:
+  setup-panel:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Install sshpass
-        run: sudo apt-get update && sudo apt-get install -y sshpass
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Connect and install 3x-ui panel
+      - name: Install Docker and Docker Compose
         run: |
-          sshpass -p "${{ inputs.ssh_password }}" ssh -o StrictHostKeyChecking=no ${{ inputs.ssh_username }}@${{ inputs.server_ip }} << 'EOF'
-            # نصب پنل 3x-ui (اسکریپت رسمی)
-            echo "Installing 3x-ui panel..."
-            bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) << ANSWERS
-            ${{ inputs.panel_port }}
-            ${{ inputs.panel_port }}
-            n
-            y
-            ANSWERS
-            
-            # منتظر بمان تا پنل بالا بیاید
-            sleep 5
-            
-            # گرفتن اطلاعات لاگین از فایل پنل (در مسیر /etc/3x-ui)
-            if [ -f /etc/3x-ui/config.json ]; then
-              USER=$(grep -oP '"username": "\K[^"]+' /etc/3x-ui/config.json)
-              PASS=$(grep -oP '"password": "\K[^"]+' /etc/3x-ui/config.json)
-              PORT=$(grep -oP '"webPort": \K[0-9]+' /etc/3x-ui/config.json)
-              echo "PANEL_USER=$USER" >> $GITHUB_ENV
-              echo "PANEL_PASS=$PASS" >> $GITHUB_ENV
-              echo "PANEL_PORT=$PORT" >> $GITHUB_ENV
-              echo "PANEL_URL=http://${{ inputs.server_ip }}:$PORT"
-            else
-              echo "Config file not found, trying to get from log..."
-              sleep 3
-              JOURNAL=$(journalctl -u x-ui -n 20 --no-pager)
-              USER=$(echo "$JOURNAL" | grep -oP 'username:\s*\K\S+' | head -1)
-              PASS=$(echo "$JOURNAL" | grep -oP 'password:\s*\K\S+' | head -1)
-              PORT=${{ inputs.panel_port }}
-              echo "PANEL_USER=$USER" >> $GITHUB_ENV
-              echo "PANEL_PASS=$PASS" >> $GITHUB_ENV
-              echo "PANEL_PORT=$PORT" >> $GITHUB_ENV
+          sudo apt update
+          sudo apt install -y docker.io docker-compose
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          sudo usermod -aG docker $USER
+
+      - name: Run 3x-ui panel (Xray panel)
+        run: |
+          docker run -d \
+            --name xray-panel \
+            --restart unless-stopped \
+            -p 54321:54321 \
+            -v ~/xray-db:/etc/x-ui/ \
+            -v ~/xray-cert:/root/cert/ \
+            ghcr.io/mhsanaei/3x-ui:latest
+
+      - name: Wait for panel to be ready
+        run: |
+          echo "Waiting for panel to start..."
+          sleep 10
+          # بررسی آمادگی پنل
+          for i in {1..30}; do
+            if curl -s http://localhost:54321 > /dev/null; then
+              echo "Panel is ready"
+              break
             fi
-            
-            # ساخت یک اینباند ساده VMESS برای تست (میتوانید بعداً از پنل تنظیم کنید)
-            # این مرحله اختیاری است: یک کانفیگ پیشفرض به فایل اضافه می‌کند
-            echo "Creating a sample V2ray config (VMESS) ..."
-            mkdir -p /root/xray_configs
-            cat > /root/xray_configs/sample_vmess.json << EOL
-            {
-              "v": "2",
-              "ps": "GitHubActions-Sample",
-              "add": "${{ inputs.server_ip }}",
-              "port": "443",
-              "id": "auto-generated-by-panel",
-              "aid": "0",
-              "scy": "auto",
-              "net": "ws",
-              "type": "none",
-              "host": "",
-              "path": "/",
-              "tls": "tls"
-            }
-            EOL
-            echo "Sample config saved to /root/xray_configs/sample_vmess.json"
-          EOF
-        shell: bash
+            sleep 2
+          done
 
-      - name: Extract and display panel credentials
+      - name: Download and run Cloudflare Tunnel (trycloudflare.com)
+        id: tunnel
         run: |
-          echo "============================================="
-          echo "✅ Panel installed successfully!"
-          echo "Panel URL: http://${{ inputs.server_ip }}:${{ inputs.panel_port }}"
-          echo "Username: $PANEL_USER"
-          echo "Password: $PANEL_PASS"
-          echo "============================================="
-          echo "💡 You can now log in and create V2ray/Xray configs from the panel."
-          echo "   The panel uses Xray core; you can generate VLESS, VMESS, Trojan, etc."
-          echo "   For V2ray, just copy the config from panel."
-        env:
-          PANEL_USER: ${{ env.PANEL_USER }}
-          PANEL_PASS: ${{ env.PANEL_PASS }}
+          # دانلود cloudflared
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared-linux-amd64
+          # اجرا در پس‌زمینه و ذخیره لاگ
+          nohup ./cloudflared-linux-amd64 tunnel --url http://localhost:54321 --logfile cloudflared.log &
+          sleep 15
+          # استخراج URL اختصاصی از لاگ
+          TUNNEL_URL=$(grep -oP 'https://[a-z0-9\-]+\.trycloudflare\.com' cloudflared.log | head -1)
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+          echo "::notice title=Tunnel URL::$TUNNEL_URL"
 
-      - name: (Optional) Add Cloudflare DNS record
-        if: ${{ inputs.cf_email != '' && inputs.cf_api_key != '' && inputs.cf_domain != '' }}
+      - name: Get panel credentials
+        id: credentials
         run: |
-          # این مرحله یک زیردامنه مثل panel.example.com به آی‌پی سرور اضافه می‌کند
-          curl -X POST "https://api.cloudflare.com/client/v4/zones" \
-            -H "X-Auth-Email: ${{ inputs.cf_email }}" \
-            -H "X-Auth-Key: ${{ inputs.cf_api_key }}" \
-            -H "Content-Type: application/json" \
-            --data '{"name":"${{ inputs.cf_domain }}"}' > zones.json
-          ZONE_ID=$(jq -r '.result[0].id' zones.json)
-          RECORD_NAME="panel.${{ inputs.cf_domain }}"
-          curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
-            -H "X-Auth-Email: ${{ inputs.cf_email }}" \
-            -H "X-Auth-Key: ${{ inputs.cf_api_key }}" \
-            -H "Content-Type: application/json" \
-            --data "{\"type\":\"A\",\"name\":\"$RECORD_NAME\",\"content\":\"${{ inputs.server_ip }}\",\"ttl\":120,\"proxied\":false}"
-          echo "✅ Cloudflare DNS record created: $RECORD_NAME -> ${{ inputs.server_ip }}"
-          echo "🔗 Access panel at: http://$RECORD_NAME:${{ inputs.panel_port }}"
+          # در 3x-ui پیش‌فرض admin/admin است
+          DEFAULT_USER="admin"
+          DEFAULT_PASS="admin"
+          echo "PANEL_URL=${{ env.TUNNEL_URL }}" >> $GITHUB_OUTPUT
+          echo "USERNAME=$DEFAULT_USER" >> $GITHUB_OUTPUT
+          echo "PASSWORD=$DEFAULT_PASS" >> $GITHUB_OUTPUT
+          
+          echo "::notice title=Access Panel::URL: ${{ env.TUNNEL_URL }}"
+          echo "::notice title=Username::$DEFAULT_USER"
+          echo "::notice title=Password::$DEFAULT_PASS"
+
+      - name: Show connection info (for manual use)
+        run: |
+          echo "=============================="
+          echo "✅ پنل Xray با موفقیت راه‌اندازی شد!"
+          echo "🔗 لینک پنل: ${{ env.TUNNEL_URL }}"
+          echo "👤 نام کاربری: admin"
+          echo "🔑 رمز عبور: admin"
+          echo ""
+          echo "⚠️ توجه: پس از بسته شدن این Workflow (یا اتمام زمان اجرا)، پنل غیرفعال می‌شود."
+          echo "برای ساخت کانفیگ V2Ray وارد پنل شوید و از منوی 'Inbound' یک inbound اضافه کنید."
+          echo "=============================="
+
+      - name: Keep the workflow alive (6 hours max)
+        run: |
+          echo "Maintaining tunnel for up to 6 hours..."
+          echo "Press Ctrl+C to stop locally, or cancel workflow from GitHub UI."
+          sleep 6h
