@@ -9,49 +9,71 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: نصب پیش‌نیازها
+      - name: 📥 دریافت فایل‌های پروژه
+        uses: actions/checkout@v4
+
+      - name: 🐍 نصب Python و پیش‌نیازها
         run: |
           sudo apt-get update
           sudo apt-get install -y python3 python3-pip wget
-          pip3 install flask flask-socketio yt-dlp
 
-      - name: دریافت cloudflared
+          python3 -m pip install --upgrade pip
+
+          # نصب پکیج‌ها از requirements.txt
+          pip3 install -r requirements.txt
+
+      - name: ☁️ دریافت cloudflared
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+
           chmod +x cloudflared-linux-amd64
+
           sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
 
-      - name: دریافت فایل‌های برنامه
-        uses: actions/checkout@v4   # فایل app.py و پوشه static را از مخزن می‌خواند
-
-      - name: اجرای سرور و تونل
+      - name: 🚀 اجرای Flask و ساخت تونل
         run: |
           echo "🚀 اجرای برنامه Flask..."
-          python3 app.py &
-          sleep 5
-          
+
+          # اجرای برنامه در پس‌زمینه
+          nohup python3 app.py > app.log 2>&1 &
+
+          sleep 10
+
+          echo "📄 لاگ برنامه Flask:"
+          cat app.log || true
+
           echo "🔗 برقراری تونل Cloudflare..."
-          # cloudflared tunnel --url http://localhost:5000 را در بک‌گراند اجرا می‌کنیم
-          # خروجی آن را به فایل می‌فرستیم تا لینک را استخراج کنیم
+
+          # اجرای تونل
           nohup cloudflared tunnel --url http://localhost:5000 > tunnel.log 2>&1 &
-          sleep 5
-          
-          # لینک trycloudflare.com را از لاگ پیدا کن
-          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' tunnel.log | head -1)
-          
+
+          sleep 15
+
+          # استخراج لینک تونل
+          TUNNEL_URL=$(grep -oE 'https://[-a-zA-Z0-9.]*trycloudflare.com' tunnel.log | head -1)
+
           if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ نتوانست لینک تونل را پیدا کند. محتوای لاگ:"
-            cat tunnel.log
+            echo "❌ لینک تونل پیدا نشد."
+            echo ""
+            echo "📄 محتوای tunnel.log:"
+            cat tunnel.log || true
+            echo ""
+            echo "📄 محتوای app.log:"
+            cat app.log || true
             exit 1
           fi
-          
+
+          echo ""
           echo "=============================================="
           echo "🌐 آدرس سایت شما:"
           echo "👉 $TUNNEL_URL"
           echo "=============================================="
-          echo "تا زمانی که این تب Actions باز است، سایت آنلاین می‌ماند."
-          echo "برای قطع سرویس، workflow را Cancel کنید."
           echo ""
-          
-          # نگه داشتن workflow تا زمانی که دستی کنسل شود
-          while true; do sleep 60; done
+          echo "✅ برنامه با موفقیت اجرا شد."
+          echo "تا وقتی Workflow فعال باشد سایت آنلاین می‌ماند."
+          echo ""
+
+          # جلوگیری از بسته شدن Job
+          while true; do
+            sleep 60
+          done
